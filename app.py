@@ -1,6 +1,8 @@
 import pandas as pd
 import streamlit as st
 
+from utils import prepare_backstage_data
+
 st.set_page_config(
     page_title="Pro Consulting",
     page_icon="💎",
@@ -92,38 +94,76 @@ elif page == "📥 Import Backstage":
         help="Le fichier doit être au format Excel .xlsx",
     )
 
-    if uploaded_file is not None:
+       if uploaded_file is not None:
         try:
-            dataframe = pd.read_excel(
+            raw_dataframe = pd.read_excel(
                 uploaded_file,
                 sheet_name=0,
             )
 
-            st.session_state.backstage_data = dataframe
+            prepared_dataframe, detected_columns = prepare_backstage_data(
+                raw_dataframe
+            )
+
+            # Conservation des deux versions
+            st.session_state.backstage_data = prepared_dataframe
+            st.session_state.backstage_raw_data = raw_dataframe
             st.session_state.backstage_filename = uploaded_file.name
+            st.session_state.detected_columns = detected_columns
 
-            st.success("L’export Backstage a été lu correctement.")
+            st.success(
+                "L’export Backstage est valide et a été préparé correctement."
+            )
 
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
 
-            col1.metric("Nombre de lignes", len(dataframe))
-            col2.metric("Nombre de colonnes", len(dataframe.columns))
-            col3.metric("Fichier", uploaded_file.name)
+            col1.metric(
+                "Créateurs importés",
+                len(prepared_dataframe),
+            )
 
-            st.subheader("Aperçu de l’export")
+            col2.metric(
+                "Diamants générés",
+                f"{prepared_dataframe['Diamants'].sum():,.0f}",
+            )
+
+            col3.metric(
+                "Total heures LIVE",
+                f"{prepared_dataframe['Heures LIVE'].sum():,.1f} h",
+            )
+
+            col4.metric(
+                "Colonnes détectées",
+                len(detected_columns),
+            )
+
+            st.subheader("Données préparées")
 
             st.dataframe(
-                dataframe.head(20),
+                prepared_dataframe.head(30),
                 use_container_width=True,
                 hide_index=True,
             )
 
-            with st.expander("Afficher les colonnes détectées"):
-                for column in dataframe.columns:
-                    st.write(f"• {column}")
+            with st.expander(
+                "Voir la correspondance des colonnes Backstage"
+            ):
+                for internal_name, original_name in detected_columns.items():
+                    st.write(
+                        f"**{internal_name}** → {original_name}"
+                    )
+
+        except ValueError as error:
+            st.error(
+                "L’export Backstage ne contient pas toutes les "
+                "colonnes obligatoires."
+            )
+            st.code(str(error))
 
         except Exception as error:
-            st.error("Impossible de lire ce fichier Excel.")
+            st.error(
+                "Une erreur inattendue empêche la lecture du fichier."
+            )
             st.code(str(error))
 
 
