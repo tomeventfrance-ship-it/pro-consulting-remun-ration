@@ -168,7 +168,35 @@ elif page == "📥 Import Backstage":
 # --------------------------------------------------
 # PAGE PARAMÈTRES
 # --------------------------------------------------
+elif page == "💎 Créateurs":
 
+    st.title("💎 Calcul des créateurs")
+
+    if st.session_state.backstage_data is None:
+        st.warning("Importez d'abord un export Backstage.")
+        st.stop()
+
+    creator_level = int(
+        st.session_state.creator_level
+    )
+
+    dataframe = calculate_creator_rewards(
+        st.session_state.backstage_data,
+        creator_level,
+    )
+
+    st.success("Calcul terminé.")
+
+    st.metric(
+        "Nombre de créateurs",
+        len(dataframe),
+    )
+
+    st.dataframe(
+        dataframe,
+        use_container_width=True,
+        hide_index=True,
+    )
 elif page == "⚙️ Paramètres":
     st.title("⚙️ Paramètres mensuels")
 
