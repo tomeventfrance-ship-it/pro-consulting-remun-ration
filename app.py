@@ -75,8 +75,6 @@ if page == "🏠 Accueil":
         "Utilisez le menu de gauche pour importer l’export "
         "et renseigner les paramètres mensuels."
     )
-
-
 # --------------------------------------------------
 # PAGE IMPORT BACKSTAGE
 # --------------------------------------------------
@@ -94,7 +92,7 @@ elif page == "📥 Import Backstage":
         help="Le fichier doit être au format Excel .xlsx",
     )
 
-       if uploaded_file is not None:
+    if uploaded_file is not None:
         try:
             raw_dataframe = pd.read_excel(
                 uploaded_file,
@@ -105,7 +103,6 @@ elif page == "📥 Import Backstage":
                 raw_dataframe
             )
 
-            # Conservation des deux versions
             st.session_state.backstage_data = prepared_dataframe
             st.session_state.backstage_raw_data = raw_dataframe
             st.session_state.backstage_filename = uploaded_file.name
@@ -165,8 +162,6 @@ elif page == "📥 Import Backstage":
                 "Une erreur inattendue empêche la lecture du fichier."
             )
             st.code(str(error))
-
-
 # --------------------------------------------------
 # PAGE PARAMÈTRES
 # --------------------------------------------------
