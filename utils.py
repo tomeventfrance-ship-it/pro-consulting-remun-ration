@@ -231,3 +231,153 @@ def prepare_backstage_data(
     )
 
     return prepared_data, detected_columns
+# Barème général des créateurs
+CREATOR_RATES = {
+    5: 0.005,
+    7: 0.010,
+    9: 0.015,
+    13: 0.020,
+    15: 0.025,
+}
+
+
+def calculate_creator_rewards(
+    dataframe: pd.DataFrame,
+    creator_level: int,
+) -> pd.DataFrame:
+    """
+    Calcule les rémunérations des créateurs.
+    """
+    result = dataframe.copy()
+
+    creator_rate = CREATOR_RATES.get(
+        creator_level,
+        0.0,
+    )
+
+    rewards = []
+    base_rates = []
+    activity_bonuses = []
+    reward_reasons = []
+    hierarchy_eligibility = []
+
+    for _, row in result.iterrows():
+        diamonds = int(row["Diamants"])
+        hours = float(row["Heures LIVE"])
+        days = int(row["Jours valides"])
+
+        echelon = normalize_text(
+            row["Statut échelon"]
+        )
+
+        # ------------------------------------------
+        # ÉLIGIBILITÉ CONSULTANTS / MANAGERS
+        # ------------------------------------------
+
+        hierarchy_ok = (
+            diamonds >= 5_000
+            and hours >= 20
+            and days >= 8
+            and "non maintenu" not in echelon
+        )
+
+        hierarchy_eligibility.append(
+            "Oui" if hierarchy_ok else "Non"
+        )
+
+        # ------------------------------------------
+        # MOINS DE 35 000 DIAMANTS
+        # ------------------------------------------
+
+        if diamonds < 35_000:
+            rewards.append(0)
+            base_rates.append(0.0)
+            activity_bonuses.append(0.0)
+            reward_reasons.append(
+                "Moins de 35 000 diamants"
+            )
+            continue
+
+        # ------------------------------------------
+        # ENTRE 35 000 ET 99 999 DIAMANTS
+        # ------------------------------------------
+
+        if diamonds < 100_000:
+            maintained_or_up = (
+                "maintien" in echelon
+                or "maintenu" in echelon
+                or "montee" in echelon
+            )
+
+            if maintained_or_up:
+                rewards.append(500)
+                reward_reasons.append(
+                    "Prime fixe 35k–100k"
+                )
+            else:
+                rewards.append(0)
+                reward_reasons.append(
+                    "Échelon non maintenu"
+                )
+
+            base_rates.append(0.0)
+            activity_bonuses.append(0.0)
+            continue
+
+        # ------------------------------------------
+        # À PARTIR DE 100 000 DIAMANTS
+        # ------------------------------------------
+
+        activity_minimum_ok = (
+            hours >= 20
+            and days >= 8
+        )
+
+        if not activity_minimum_ok:
+            rewards.append(0)
+            base_rates.append(0.0)
+            activity_bonuses.append(0.0)
+            reward_reasons.append(
+                "Minimum 20 h et 8 jours non atteint"
+            )
+            continue
+
+        # Échelon non maintenu :
+        # taux de base fixe à 0,5 %
+        if "non maintenu" in echelon:
+            base_rate = 0.005
+        else:
+            base_rate = creator_rate
+
+        # Bonus d’activité non cumulable
+        if days >= 22 and hours >= 80:
+            activity_bonus = 0.010
+        elif days >= 15 and hours >= 40:
+            activity_bonus = 0.005
+        else:
+            activity_bonus = 0.0
+
+        raw_reward = diamonds * (
+            base_rate + activity_bonus
+        )
+
+        final_reward = floor_to_hundred(
+            raw_reward
+        )
+
+        rewards.append(final_reward)
+        base_rates.append(base_rate)
+        activity_bonuses.append(
+            activity_bonus
+        )
+        reward_reasons.append(
+            "Taux de base + bonus activité"
+        )
+
+    result["Taux de base"] = base_rates
+    result["Bonus activité"] = activity_bonuses
+    result["Rémunération 💎"] = rewards
+    result["Motif rémunération"] = reward_reasons
+    result["Compté hiérarchie"] = hierarchy_eligibility
+
+    return result
