@@ -392,10 +392,12 @@ elif page == "👥 Consultants":
             int(st.session_state.creator_level),
         )
 
-        consultant_results["Inclure dans le calcul"] = "Oui"
-consultant_results["Mode paiement"] = "Diamants"
+   creator_results["Total déduction €"] = (
+    creator_results["Facture €"]
+    + creator_results["Coût diamants €"]
+)
 
-        st.session_state.creator_results = creator_results
+st.session_state.creator_results = creator_results
         st.session_state.creator_signature = creator_signature
 
     creator_results = st.session_state.creator_results
