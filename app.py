@@ -2,8 +2,10 @@ import pandas as pd
 import streamlit as st
 
 from utils import (
+    calculate_consultant_rewards,
     calculate_creator_rewards,
     prepare_backstage_data,
+)
 )
 st.set_page_config(
     page_title="Pro Consulting",
@@ -50,6 +52,7 @@ page = st.sidebar.radio(
         "📥 Import Backstage",
         "⚙️ Paramètres",
         "💎 Créateurs",
+        "👥 Consultants",
     ],
 )
 
