@@ -392,7 +392,7 @@ elif page == "👥 Consultants":
             int(st.session_state.creator_level),
         )
 
-   creator_results["Total déduction €"] = (
+    creator_results["Total déduction €"] = (
     creator_results["Facture €"]
     + creator_results["Coût diamants €"]
 )
