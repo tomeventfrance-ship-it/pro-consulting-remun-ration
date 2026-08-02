@@ -381,25 +381,20 @@ elif page == "👥 Consultants":
         st.session_state.backstage_filename,
         st.session_state.creator_level,
     )
-
     if (
         "creator_results" not in st.session_state
         or st.session_state.get("creator_signature")
-        != creator_signature
+        != calculation_signature
     ):
         creator_results = calculate_creator_rewards(
             st.session_state.backstage_data,
             int(st.session_state.creator_level),
         )
 
-    creator_results["Total déduction €"] = (
-    creator_results["Facture €"]
-    + creator_results["Coût diamants €"]
-)
+        creator_results["Mode paiement"] = "Diamants"
 
-st.session_state.creator_results = creator_results
-        st.session_state.creator_signature = creator_signature
-
+        st.session_state.creator_results = creator_results
+        st.session_state.creator_signature = calculation_signature
     creator_results = st.session_state.creator_results
 
     # Recalcul lorsque le fichier ou le palier consultant change
