@@ -86,8 +86,11 @@ def reset_calculations():
         "creator_signature",
         "consultant_results",
         "consultant_signature",
+        "responsable_results",
+        "responsable_signature",
         "creator_payment_editor",
         "consultant_payment_editor",
+        "responsable_payment_editor",
     ):
         st.session_state.pop(key, None)
 
@@ -112,6 +115,76 @@ def financial_columns(dataframe):
     result["Total déduction €"] = (
         result["Facture €"] + result["Coût diamants €"]
     )
+    return result
+
+
+RESPONSABLE_RATES = {
+    5: 0.010,
+    7: 0.015,
+    9: 0.018,
+    11: 0.020,
+    13: 0.025,
+}
+
+
+def floor_to_hundred(value):
+    return int(float(value) // 100 * 100)
+
+
+def calculate_responsable_rewards(
+    creator_results,
+    responsable_level,
+    minimum_group_diamonds=600_000,
+):
+    required_columns = {
+        "Groupe",
+        "Diamants",
+        "Compté hiérarchie",
+    }
+    missing_columns = required_columns.difference(creator_results.columns)
+    if missing_columns:
+        raise ValueError(
+            "Colonnes manquantes pour calculer les responsables : "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    data = creator_results.copy()
+    data["Groupe"] = data["Groupe"].fillna("").astype(str).str.strip()
+    data = data[data["Groupe"].ne("") & data["Groupe"].ne("nan")]
+
+    rate = RESPONSABLE_RATES.get(int(responsable_level), 0.0)
+    rows = []
+
+    for responsable, group in data.groupby("Groupe", dropna=False):
+        eligible = group[group["Compté hiérarchie"] == "Oui"]
+        eligible_diamonds = int(eligible["Diamants"].sum())
+        threshold_reached = eligible_diamonds >= minimum_group_diamonds
+        reward = (
+            floor_to_hundred(eligible_diamonds * rate)
+            if threshold_reached
+            else 0
+        )
+
+        rows.append(
+            {
+                "Responsable performance": responsable,
+                "Créateurs rattachés": len(group),
+                "Créateurs comptés": len(eligible),
+                "Diamants éligibles": eligible_diamonds,
+                "Seuil atteint": "Oui" if threshold_reached else "Non",
+                "Taux": rate if threshold_reached else 0.0,
+                "Rémunération 💎": reward,
+            }
+        )
+
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result.sort_values(
+            "Diamants éligibles",
+            ascending=False,
+            inplace=True,
+        )
+        result.reset_index(drop=True, inplace=True)
     return result
 
 
@@ -140,6 +213,7 @@ page = st.sidebar.radio(
         "🛡️ Administration",
         "💎 Créateurs",
         "👥 Consultants",
+        "📈 Responsables performance",
     ],
 )
 
@@ -344,6 +418,39 @@ elif page == "🛡️ Administration":
         "Une ligne supprimée est automatiquement réintégrée aux calculs."
     )
 
+    if st.session_state.backstage_data is not None:
+        backstage = st.session_state.backstage_data
+        detected_rows = []
+
+        if "Agent" in backstage.columns:
+            for value in backstage["Agent"].dropna().unique():
+                email = normalize_email(value)
+                if email and email != "nan":
+                    detected_rows.append(
+                        {"Adresse détectée": email, "Emplacement": "Agent"}
+                    )
+
+        if "Groupe" in backstage.columns:
+            for value in backstage["Groupe"].dropna().unique():
+                email = normalize_email(value)
+                if email and email != "nan":
+                    detected_rows.append(
+                        {"Adresse détectée": email, "Emplacement": "Groupe"}
+                    )
+
+        if detected_rows:
+            detected_dataframe = pd.DataFrame(detected_rows).drop_duplicates()
+            with st.expander(
+                "🔎 Voir toutes les adresses détectées dans l’export"
+            ):
+                st.dataframe(
+                    detected_dataframe.sort_values(
+                        ["Emplacement", "Adresse détectée"]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
     exclusions_dataframe = pd.DataFrame(
         st.session_state.exclusions,
         columns=[
@@ -360,8 +467,11 @@ elif page == "🛡️ Administration":
         hide_index=True,
         column_config={
             "Adresse e-mail": st.column_config.TextColumn(
-                "Adresse e-mail",
-                help="Adresse exacte présente dans l’export Backstage.",
+                "E-mail ou nom du groupe",
+                help=(
+                    "Saisissez l’adresse exacte de la colonne Agent ou le "
+                    "nom exact présent dans la colonne Groupe."
+                ),
             ),
             "Exclure consultants": st.column_config.CheckboxColumn(
                 "Exclure consultants",
@@ -388,6 +498,9 @@ elif page == "🛡️ Administration":
         st.session_state.pop("consultant_results", None)
         st.session_state.pop("consultant_signature", None)
         st.session_state.pop("consultant_payment_editor", None)
+        st.session_state.pop("responsable_results", None)
+        st.session_state.pop("responsable_signature", None)
+        st.session_state.pop("responsable_payment_editor", None)
         st.success(
             f"{len(st.session_state.exclusions)} exclusion(s) enregistrée(s)."
         )
@@ -620,6 +733,140 @@ elif page == "👥 Consultants":
     with st.expander("Afficher le détail complet"):
         st.dataframe(
             consultant_results,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+elif page == "📈 Responsables performance":
+    st.title("📈 Calcul des responsables performance")
+
+    if st.session_state.backstage_data is None:
+        st.warning("Importez d’abord un export Backstage.")
+        st.stop()
+
+    creator_signature = (
+        st.session_state.backstage_filename,
+        st.session_state.creator_level,
+    )
+    if (
+        "creator_results" not in st.session_state
+        or st.session_state.get("creator_signature") != creator_signature
+    ):
+        creator_results = calculate_creator_rewards(
+            st.session_state.backstage_data,
+            int(st.session_state.creator_level),
+        )
+        creator_results["Mode paiement"] = "Diamants"
+        st.session_state.creator_results = creator_results
+        st.session_state.creator_signature = creator_signature
+
+    exclusion_signature = tuple(sorted(excluded_emails("responsables")))
+    responsable_signature = (
+        st.session_state.backstage_filename,
+        st.session_state.creator_level,
+        st.session_state.manager_level,
+        exclusion_signature,
+    )
+
+    if (
+        "responsable_results" not in st.session_state
+        or st.session_state.get("responsable_signature")
+        != responsable_signature
+    ):
+        responsable_results = calculate_responsable_rewards(
+            creator_results=st.session_state.creator_results,
+            responsable_level=int(st.session_state.manager_level),
+            minimum_group_diamonds=600_000,
+        )
+        responsable_results["Mode paiement"] = "Diamants"
+        st.session_state.responsable_results = responsable_results
+        st.session_state.responsable_signature = responsable_signature
+
+    responsable_results = st.session_state.responsable_results.copy()
+
+    if responsable_results.empty:
+        st.warning(
+            "Aucun responsable performance n’a été détecté dans la "
+            "colonne Groupe."
+        )
+        st.stop()
+
+    excluded = excluded_emails("responsables")
+    responsable_results["Inclure dans le calcul"] = responsable_results[
+        "Responsable performance"
+    ].map(lambda value: "Non" if normalize_email(value) in excluded else "Oui")
+
+    excluded_mask = responsable_results["Inclure dans le calcul"] == "Non"
+    responsable_results.loc[
+        excluded_mask,
+        ["Taux", "Rémunération 💎"],
+    ] = 0
+
+    metric1, metric2, metric3, metric4 = st.columns(4)
+    metric1.metric("Responsables détectés", len(responsable_results))
+    metric2.metric(
+        "Responsables rémunérés",
+        int((responsable_results["Rémunération 💎"] > 0).sum()),
+    )
+    metric3.metric(
+        "Diamants éligibles",
+        f"{responsable_results.loc[~excluded_mask, 'Diamants éligibles'].sum():,.0f} 💎",
+    )
+    metric4.metric(
+        "Total rémunérations",
+        f"{responsable_results['Rémunération 💎'].sum():,.0f} 💎",
+    )
+
+    st.divider()
+    payment_table = responsable_results[
+        [
+            "Responsable performance",
+            "Inclure dans le calcul",
+            "Créateurs rattachés",
+            "Créateurs comptés",
+            "Diamants éligibles",
+            "Seuil atteint",
+            "Taux",
+            "Rémunération 💎",
+            "Mode paiement",
+        ]
+    ].copy()
+
+    edited_payment_table = st.data_editor(
+        payment_table,
+        use_container_width=True,
+        hide_index=True,
+        disabled=[
+            "Responsable performance",
+            "Inclure dans le calcul",
+            "Créateurs rattachés",
+            "Créateurs comptés",
+            "Diamants éligibles",
+            "Seuil atteint",
+            "Taux",
+            "Rémunération 💎",
+        ],
+        column_config={
+            "Mode paiement": st.column_config.SelectboxColumn(
+                "Mode paiement",
+                options=["Diamants", "Facture €"],
+                required=True,
+            )
+        },
+        key="responsable_payment_editor",
+    )
+
+    responsable_results["Mode paiement"] = edited_payment_table[
+        "Mode paiement"
+    ].values
+    responsable_results = financial_columns(responsable_results)
+    st.session_state.responsable_results = responsable_results
+    show_financial_summary(responsable_results)
+
+    with st.expander("Afficher le détail complet"):
+        st.dataframe(
+            responsable_results,
             use_container_width=True,
             hide_index=True,
         )
