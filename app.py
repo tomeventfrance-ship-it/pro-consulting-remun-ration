@@ -369,7 +369,264 @@ elif page == "💎 Créateurs":
         "Déduction totale",
         f"{total_deduction:,.2f} €",
     )
+elif page == "👥 Consultants":
+    st.title("👥 Calcul des consultants")
 
+    if st.session_state.backstage_data is None:
+        st.warning("Importez d’abord un export Backstage.")
+        st.stop()
+
+    # Recalcul automatique des créateurs si nécessaire
+    creator_signature = (
+        st.session_state.backstage_filename,
+        st.session_state.creator_level,
+    )
+
+    if (
+        "creator_results" not in st.session_state
+        or st.session_state.get("creator_signature")
+        != creator_signature
+    ):
+        creator_results = calculate_creator_rewards(
+            st.session_state.backstage_data,
+            int(st.session_state.creator_level),
+        )
+
+        creator_results["Mode paiement"] = "Diamants"
+
+        st.session_state.creator_results = creator_results
+        st.session_state.creator_signature = creator_signature
+
+    creator_results = st.session_state.creator_results
+
+    # Recalcul lorsque le fichier ou le palier consultant change
+    consultant_signature = (
+        st.session_state.backstage_filename,
+        st.session_state.creator_level,
+        st.session_state.consultant_level,
+    )
+
+    if (
+        "consultant_results" not in st.session_state
+        or st.session_state.get("consultant_signature")
+        != consultant_signature
+    ):
+        consultant_results = calculate_consultant_rewards(
+            creator_results=creator_results,
+            consultant_level=int(
+                st.session_state.consultant_level
+            ),
+            minimum_team_diamonds=200_000,
+        )
+
+        consultant_results["Mode paiement"] = "Diamants"
+
+        st.session_state.consultant_results = consultant_results
+        st.session_state.consultant_signature = consultant_signature
+
+    consultant_results = (
+        st.session_state.consultant_results.copy()
+    )
+
+    if consultant_results.empty:
+        st.warning(
+            "Aucun consultant n’a été détecté dans la colonne Agent."
+        )
+        st.stop()
+
+    # --------------------------------------------------
+    # INDICATEURS
+    # --------------------------------------------------
+
+    total_consultants = len(consultant_results)
+
+    rewarded_consultants = int(
+        (
+            consultant_results["Rémunération 💎"] > 0
+        ).sum()
+    )
+
+    total_eligible_diamonds = int(
+        consultant_results["Diamants éligibles"].sum()
+    )
+
+    total_reward_diamonds = int(
+        consultant_results["Rémunération 💎"].sum()
+    )
+
+    metric1, metric2, metric3, metric4 = st.columns(4)
+
+    metric1.metric(
+        "Consultants détectés",
+        total_consultants,
+    )
+
+    metric2.metric(
+        "Consultants rémunérés",
+        rewarded_consultants,
+    )
+
+    metric3.metric(
+        "Diamants éligibles",
+        f"{total_eligible_diamonds:,.0f} 💎",
+    )
+
+    metric4.metric(
+        "Total rémunérations",
+        f"{total_reward_diamonds:,.0f} 💎",
+    )
+
+    st.divider()
+
+    # --------------------------------------------------
+    # MODES DE PAIEMENT
+    # --------------------------------------------------
+
+    st.subheader("Rémunérations des consultants")
+
+    payment_table = consultant_results[
+        [
+            "Consultant",
+            "Créateurs rattachés",
+            "Créateurs comptés",
+            "Diamants éligibles",
+            "Seuil atteint",
+            "Taux",
+            "Rémunération 💎",
+            "Mode paiement",
+        ]
+    ].copy()
+
+    edited_payment_table = st.data_editor(
+        payment_table,
+        use_container_width=True,
+        hide_index=True,
+        disabled=[
+            "Consultant",
+            "Créateurs rattachés",
+            "Créateurs comptés",
+            "Diamants éligibles",
+            "Seuil atteint",
+            "Taux",
+            "Rémunération 💎",
+        ],
+        column_config={
+            "Mode paiement": st.column_config.SelectboxColumn(
+                "Mode paiement",
+                options=[
+                    "Diamants",
+                    "Facture €",
+                ],
+                required=True,
+            ),
+            "Diamants éligibles": st.column_config.NumberColumn(
+                "Diamants éligibles",
+                format="%d 💎",
+            ),
+            "Rémunération 💎": st.column_config.NumberColumn(
+                "Rémunération",
+                format="%d 💎",
+            ),
+            "Taux": st.column_config.NumberColumn(
+                "Taux",
+                format="%.1f %%",
+            ),
+        },
+        key="consultant_payment_editor",
+    )
+
+    consultant_results["Mode paiement"] = (
+        edited_payment_table["Mode paiement"].values
+    )
+
+    # --------------------------------------------------
+    # CONVERSIONS FINANCIÈRES
+    # --------------------------------------------------
+
+    coin_price = (
+        float(st.session_state.coin_pack_price) / 1000
+    )
+
+    invoice_rate = float(
+        st.session_state.invoice_rate
+    )
+
+    consultant_results["Facture €"] = (
+        consultant_results.apply(
+            lambda row: int(
+                row["Rémunération 💎"] * invoice_rate
+            )
+            if row["Mode paiement"] == "Facture €"
+            else 0,
+            axis=1,
+        )
+    )
+
+    consultant_results["Coût diamants €"] = (
+        consultant_results.apply(
+            lambda row: round(
+                row["Rémunération 💎"] * coin_price,
+                2,
+            )
+            if row["Mode paiement"] == "Diamants"
+            else 0.0,
+            axis=1,
+        )
+    )
+
+    consultant_results["Total déduction €"] = (
+        consultant_results["Facture €"]
+        + consultant_results["Coût diamants €"]
+    )
+
+    st.session_state.consultant_results = (
+        consultant_results
+    )
+
+    # --------------------------------------------------
+    # RÉCAPITULATIF FINANCIER
+    # --------------------------------------------------
+
+    total_invoices = int(
+        consultant_results["Facture €"].sum()
+    )
+
+    total_coin_cost = float(
+        consultant_results["Coût diamants €"].sum()
+    )
+
+    total_deduction = float(
+        consultant_results["Total déduction €"].sum()
+    )
+
+    st.subheader("Récapitulatif financier")
+
+    total1, total2, total3 = st.columns(3)
+
+    total1.metric(
+        "Total factures",
+        f"{total_invoices:,.0f} €",
+    )
+
+    total2.metric(
+        "Coût des diamants",
+        f"{total_coin_cost:,.2f} €",
+    )
+
+    total3.metric(
+        "Déduction totale",
+        f"{total_deduction:,.2f} €",
+    )
+
+    with st.expander(
+        "Afficher le détail complet",
+        expanded=False,
+    ):
+        st.dataframe(
+            consultant_results,
+            use_container_width=True,
+            hide_index=True,
+        )
     # --------------------------------------------------
     # TABLEAU COMPLET
     # --------------------------------------------------
