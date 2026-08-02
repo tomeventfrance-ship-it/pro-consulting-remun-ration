@@ -31,6 +31,8 @@ DEFAULT_VALUES = {
     "invoice_rate": 0.0084,
     "charges_rate": 24.6,
     "exclusions": [],
+    "director_branch_revenue_usd": 0.0,
+    "director_branch_other_expenses": 0.0,
 }
 
 for key, default_value in DEFAULT_VALUES.items():
@@ -126,6 +128,16 @@ RESPONSABLE_RATES = {
     13: 0.025,
 }
 
+DIRECTOR_RATES = {
+    4: 0.04,
+    5: 0.05,
+    7: 0.07,
+    8: 0.09,
+    10: 0.11,
+    11: 0.13,
+    13: 0.15,
+}
+
 
 def floor_to_hundred(value):
     return int(float(value) // 100 * 100)
@@ -214,6 +226,7 @@ page = st.sidebar.radio(
         "💎 Créateurs",
         "👥 Consultants",
         "📈 Responsables performance",
+        "🏢 Directeur de branche",
     ],
 )
 
@@ -869,4 +882,193 @@ elif page == "📈 Responsables performance":
             responsable_results,
             use_container_width=True,
             hide_index=True,
+        )
+
+
+elif page == "🏢 Directeur de branche":
+    st.title("🏢 Calcul du directeur de branche")
+
+    if st.session_state.backstage_data is None:
+        st.warning("Importez d’abord un export Backstage.")
+        st.stop()
+
+    creator_signature = (
+        st.session_state.backstage_filename,
+        st.session_state.creator_level,
+    )
+    if (
+        "creator_results" not in st.session_state
+        or st.session_state.get("creator_signature") != creator_signature
+    ):
+        creator_results = calculate_creator_rewards(
+            st.session_state.backstage_data,
+            int(st.session_state.creator_level),
+        )
+        creator_results["Mode paiement"] = "Diamants"
+        st.session_state.creator_results = creator_results
+        st.session_state.creator_signature = creator_signature
+
+    all_creator_results = st.session_state.creator_results.copy()
+    available_groups = sorted(
+        value
+        for value in all_creator_results["Groupe"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .unique()
+        if value and value.lower() != "nan"
+    )
+
+    st.subheader("Composition de la branche")
+    selected_groups = st.multiselect(
+        "Cochez les responsables performance appartenant à cette branche",
+        options=available_groups,
+        default=available_groups,
+        help=(
+            "Si l’export contient uniquement la branche du directeur, "
+            "laissez tous les responsables cochés."
+        ),
+        key="director_selected_groups",
+    )
+
+    if not selected_groups:
+        st.warning("Sélectionnez au moins un responsable performance.")
+        st.stop()
+
+    input1, input2 = st.columns(2)
+    revenue_usd = input1.number_input(
+        "Chiffre d’affaires Backstage de la branche ($)",
+        min_value=0.0,
+        value=float(st.session_state.director_branch_revenue_usd),
+        step=100.0,
+        key="director_revenue_input",
+    )
+    branch_other_expenses = input2.number_input(
+        "Autres dépenses propres à la branche (€)",
+        min_value=0.0,
+        value=float(st.session_state.director_branch_other_expenses),
+        step=10.0,
+        key="director_expenses_input",
+    )
+    st.session_state.director_branch_revenue_usd = revenue_usd
+    st.session_state.director_branch_other_expenses = branch_other_expenses
+
+    branch_creators = all_creator_results[
+        all_creator_results["Groupe"].isin(selected_groups)
+    ].copy()
+    if "Mode paiement" not in branch_creators.columns:
+        branch_creators["Mode paiement"] = "Diamants"
+    branch_creators = financial_columns(branch_creators)
+
+    branch_consultants = calculate_consultant_rewards(
+        creator_results=branch_creators,
+        consultant_level=int(st.session_state.consultant_level),
+        minimum_team_diamonds=200_000,
+    )
+    if not branch_consultants.empty:
+        branch_consultants["Mode paiement"] = "Diamants"
+        consultant_exclusions = excluded_emails("consultants")
+        consultant_excluded_mask = branch_consultants["Consultant"].map(
+            lambda value: normalize_email(value) in consultant_exclusions
+        )
+        branch_consultants.loc[
+            consultant_excluded_mask,
+            ["Taux", "Rémunération 💎"],
+        ] = 0
+        branch_consultants = financial_columns(branch_consultants)
+
+    branch_responsables = calculate_responsable_rewards(
+        creator_results=branch_creators,
+        responsable_level=int(st.session_state.manager_level),
+        minimum_group_diamonds=600_000,
+    )
+    if not branch_responsables.empty:
+        branch_responsables["Mode paiement"] = "Diamants"
+        responsable_exclusions = excluded_emails("responsables")
+        responsable_excluded_mask = branch_responsables[
+            "Responsable performance"
+        ].map(lambda value: normalize_email(value) in responsable_exclusions)
+        branch_responsables.loc[
+            responsable_excluded_mask,
+            ["Taux", "Rémunération 💎"],
+        ] = 0
+        branch_responsables = financial_columns(branch_responsables)
+
+    revenue_eur = revenue_usd * float(st.session_state.usd_to_eur)
+    charges_eur = revenue_eur * float(st.session_state.charges_rate) / 100
+    creator_cost = float(branch_creators["Total déduction €"].sum())
+    consultant_cost = (
+        float(branch_consultants["Total déduction €"].sum())
+        if not branch_consultants.empty
+        else 0.0
+    )
+    responsable_cost = (
+        float(branch_responsables["Total déduction €"].sum())
+        if not branch_responsables.empty
+        else 0.0
+    )
+    net_profit_before_director = max(
+        0.0,
+        revenue_eur
+        - charges_eur
+        - creator_cost
+        - consultant_cost
+        - responsable_cost
+        - branch_other_expenses,
+    )
+    director_rate = DIRECTOR_RATES.get(
+        int(st.session_state.director_level),
+        0.0,
+    )
+    director_reward = net_profit_before_director * director_rate
+    remaining_after_director = (
+        net_profit_before_director - director_reward
+    )
+
+    st.divider()
+    st.subheader("Résultat de la branche")
+    result1, result2, result3, result4 = st.columns(4)
+    result1.metric("CA converti", f"{revenue_eur:,.2f} €")
+    result2.metric(
+        f"Charges ({st.session_state.charges_rate:.1f} %)",
+        f"− {charges_eur:,.2f} €",
+    )
+    result3.metric(
+        "Bénéfice avant directeur",
+        f"{net_profit_before_director:,.2f} €",
+    )
+    result4.metric(
+        f"Rémunération directeur ({director_rate * 100:.0f} %)",
+        f"{director_reward:,.2f} €",
+    )
+
+    summary = pd.DataFrame(
+        [
+            ("Chiffre d’affaires converti", revenue_eur),
+            ("Charges sur le CA", -charges_eur),
+            ("Rémunérations créateurs", -creator_cost),
+            ("Rémunérations consultants", -consultant_cost),
+            ("Rémunérations responsables performance", -responsable_cost),
+            ("Autres dépenses de la branche", -branch_other_expenses),
+            ("Bénéfice avant directeur", net_profit_before_director),
+            ("Rémunération du directeur", -director_reward),
+            ("Bénéfice restant", remaining_after_director),
+        ],
+        columns=["Élément", "Montant €"],
+    )
+    st.dataframe(
+        summary,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Montant €": st.column_config.NumberColumn(format="%.2f €")
+        },
+    )
+
+    with st.expander("Voir les groupes sélectionnés"):
+        st.write(selected_groups)
+        st.caption(
+            f"{len(branch_creators)} créateur(s), "
+            f"{len(branch_consultants)} consultant(s) et "
+            f"{len(branch_responsables)} responsable(s) pris en compte."
         )
