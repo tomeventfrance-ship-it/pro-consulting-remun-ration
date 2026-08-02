@@ -6,7 +6,6 @@ from utils import (
     calculate_creator_rewards,
     prepare_backstage_data,
 )
-)
 st.set_page_config(
     page_title="Pro Consulting",
     page_icon="💎",
