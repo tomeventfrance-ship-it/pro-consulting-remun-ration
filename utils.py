@@ -371,3 +371,130 @@ def calculate_creator_rewards(
     result["Compté hiérarchie"] = hierarchy_eligibility
 
     return result
+# Barème général des consultants
+CONSULTANT_RATES = {
+    5: 0.010,
+    7: 0.015,
+    9: 0.018,
+    11: 0.020,
+    13: 0.025,
+}
+
+
+def calculate_consultant_rewards(
+    creator_results: pd.DataFrame,
+    consultant_level: int,
+    minimum_team_diamonds: int = 200_000,
+) -> pd.DataFrame:
+    """
+    Regroupe les créateurs par consultant et calcule
+    la rémunération de chaque consultant.
+    """
+    required_columns = {
+        "Agent",
+        "Diamants",
+        "Compté hiérarchie",
+    }
+
+    missing_columns = required_columns.difference(
+        creator_results.columns
+    )
+
+    if missing_columns:
+        raise ValueError(
+            "Colonnes manquantes pour calculer les consultants : "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    data = creator_results.copy()
+
+    # Suppression des lignes sans consultant
+    data["Agent"] = data["Agent"].fillna("").astype(str).str.strip()
+
+    data = data[
+        data["Agent"].ne("")
+        & data["Agent"].ne("nan")
+    ].copy()
+
+    if data.empty:
+        return pd.DataFrame(
+            columns=[
+                "Consultant",
+                "Créateurs rattachés",
+                "Créateurs comptés",
+                "Diamants éligibles",
+                "Seuil atteint",
+                "Taux",
+                "Rémunération 💎",
+            ]
+        )
+
+    consultant_rate = CONSULTANT_RATES.get(
+        int(consultant_level),
+        0.0,
+    )
+
+    results = []
+
+    for consultant, group in data.groupby(
+        "Agent",
+        dropna=False,
+    ):
+        eligible_creators = group[
+            group["Compté hiérarchie"] == "Oui"
+        ]
+
+        total_creators = len(group)
+        eligible_count = len(eligible_creators)
+
+        eligible_diamonds = int(
+            eligible_creators["Diamants"].sum()
+        )
+
+        threshold_reached = (
+            eligible_diamonds >= minimum_team_diamonds
+        )
+
+        if threshold_reached:
+            raw_reward = (
+                eligible_diamonds * consultant_rate
+            )
+
+            reward = floor_to_hundred(
+                raw_reward
+            )
+        else:
+            reward = 0
+
+        results.append(
+            {
+                "Consultant": consultant,
+                "Créateurs rattachés": total_creators,
+                "Créateurs comptés": eligible_count,
+                "Diamants éligibles": eligible_diamonds,
+                "Seuil atteint": (
+                    "Oui" if threshold_reached else "Non"
+                ),
+                "Taux": (
+                    consultant_rate
+                    if threshold_reached
+                    else 0.0
+                ),
+                "Rémunération 💎": reward,
+            }
+        )
+
+    result = pd.DataFrame(results)
+
+    result.sort_values(
+        by="Diamants éligibles",
+        ascending=False,
+        inplace=True,
+    )
+
+    result.reset_index(
+        drop=True,
+        inplace=True,
+    )
+
+    return result
