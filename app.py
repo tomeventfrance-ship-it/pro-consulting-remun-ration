@@ -488,6 +488,7 @@ consultant_results["Mode paiement"] = "Diamants"
     payment_table = consultant_results[
         [
             "Consultant",
+            "Inclure dans le calcul",
             "Créateurs rattachés",
             "Créateurs comptés",
             "Diamants éligibles",
@@ -512,6 +513,11 @@ consultant_results["Mode paiement"] = "Diamants"
             "Rémunération 💎",
         ],
         column_config={
+            "Inclure dans le calcul": st.column_config.SelectboxColumn(
+    "Inclure dans le calcul",
+    options=["Oui", "Non"],
+    required=True,
+),
             "Mode paiement": st.column_config.SelectboxColumn(
                 "Mode paiement",
                 options=[
@@ -539,6 +545,17 @@ consultant_results["Mode paiement"] = "Diamants"
     consultant_results["Mode paiement"] = (
         edited_payment_table["Mode paiement"].values
     )
+consultant_results["Inclure dans le calcul"] = (
+    edited_payment_table["Inclure dans le calcul"].values
+)
+
+consultant_results.loc[
+    consultant_results["Inclure dans le calcul"] == "Non",
+    [
+        "Taux",
+        "Rémunération 💎",
+    ],
+] = 0
 
     # --------------------------------------------------
     # CONVERSIONS FINANCIÈRES
