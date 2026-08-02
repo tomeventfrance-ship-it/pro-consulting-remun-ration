@@ -392,7 +392,8 @@ elif page == "👥 Consultants":
             int(st.session_state.creator_level),
         )
 
-        creator_results["Mode paiement"] = "Diamants"
+        consultant_results["Inclure dans le calcul"] = "Oui"
+consultant_results["Mode paiement"] = "Diamants"
 
         st.session_state.creator_results = creator_results
         st.session_state.creator_signature = creator_signature
