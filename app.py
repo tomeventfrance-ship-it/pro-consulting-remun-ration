@@ -1,5 +1,8 @@
 import pandas as pd
 import streamlit as st
+from datetime import datetime
+from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
 from utils import (
     calculate_consultant_rewards,
@@ -33,6 +36,9 @@ DEFAULT_VALUES = {
     "exclusions": [],
     "director_branch_revenue_usd": 0.0,
     "director_branch_other_expenses": 0.0,
+    "use_ecb_rate": True,
+    "last_ecb_usd_to_eur": None,
+    "last_ecb_rate_date": None,
 }
 
 for key, default_value in DEFAULT_VALUES.items():
@@ -42,6 +48,40 @@ for key, default_value in DEFAULT_VALUES.items():
 
 def normalize_email(value):
     return str(value or "").strip().lower()
+
+
+def show_estimation_notice():
+    st.caption(
+        "* Les rémunérations affichées sont des estimations calculées "
+        "à partir des données importées et des paramètres enregistrés. "
+        "Elles peuvent différer des montants définitifs réellement versés."
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_ecb_usd_to_eur_rate():
+    url = (
+        "https://www.ecb.europa.eu/stats/eurofxref/"
+        "eurofxref-daily.xml"
+    )
+    request = Request(url, headers={"User-Agent": "ProConsulting/1.0"})
+    with urlopen(request, timeout=10) as response:
+        xml_content = response.read()
+
+    root = ElementTree.fromstring(xml_content)
+    rate_date = None
+    usd_per_eur = None
+
+    for element in root.iter():
+        if "time" in element.attrib:
+            rate_date = element.attrib["time"]
+        if element.attrib.get("currency") == "USD":
+            usd_per_eur = float(element.attrib["rate"])
+
+    if not rate_date or not usd_per_eur:
+        raise ValueError("Le taux USD de la BCE est introuvable.")
+
+    return 1 / usd_per_eur, rate_date
 
 
 def clean_exclusions(rows):
@@ -531,6 +571,7 @@ elif page == "🛡️ Administration":
 
 elif page == "💎 Créateurs":
     st.title("💎 Calcul des créateurs")
+    show_estimation_notice()
 
     if st.session_state.backstage_data is None:
         st.warning("Importez d’abord un export Backstage.")
@@ -620,6 +661,7 @@ elif page == "💎 Créateurs":
 
 elif page == "👥 Consultants":
     st.title("👥 Calcul des consultants")
+    show_estimation_notice()
 
     if st.session_state.backstage_data is None:
         st.warning("Importez d’abord un export Backstage.")
@@ -753,6 +795,7 @@ elif page == "👥 Consultants":
 
 elif page == "📈 Responsables performance":
     st.title("📈 Calcul des responsables performance")
+    show_estimation_notice()
 
     if st.session_state.backstage_data is None:
         st.warning("Importez d’abord un export Backstage.")
@@ -887,6 +930,7 @@ elif page == "📈 Responsables performance":
 
 elif page == "🏢 Directeur de branche":
     st.title("🏢 Calcul du directeur de branche")
+    show_estimation_notice()
 
     if st.session_state.backstage_data is None:
         st.warning("Importez d’abord un export Backstage.")
@@ -934,6 +978,69 @@ elif page == "🏢 Directeur de branche":
     if not selected_groups:
         st.warning("Sélectionnez au moins un responsable performance.")
         st.stop()
+
+    st.subheader("Taux de conversion dollar → euro")
+    rate_col1, rate_col2 = st.columns([3, 1])
+    use_ecb_rate = rate_col1.checkbox(
+        "Utiliser automatiquement le dernier taux officiel BCE disponible",
+        value=bool(st.session_state.use_ecb_rate),
+        key="director_use_ecb_rate",
+    )
+    st.session_state.use_ecb_rate = use_ecb_rate
+
+    if rate_col2.button(
+        "🔄 Actualiser le taux",
+        use_container_width=True,
+        disabled=not use_ecb_rate,
+    ):
+        fetch_ecb_usd_to_eur_rate.clear()
+        st.rerun()
+
+    active_usd_to_eur = float(st.session_state.usd_to_eur)
+    rate_source = "Taux manuel de secours"
+    rate_date = datetime.now().strftime("%Y-%m-%d")
+
+    if use_ecb_rate:
+        try:
+            active_usd_to_eur, rate_date = fetch_ecb_usd_to_eur_rate()
+            st.session_state.last_ecb_usd_to_eur = active_usd_to_eur
+            st.session_state.last_ecb_rate_date = rate_date
+            rate_source = "Banque centrale européenne"
+            st.success(
+                f"Taux BCE du {rate_date} : "
+                f"1 $ = {active_usd_to_eur:.6f} €"
+            )
+        except Exception:
+            if st.session_state.last_ecb_usd_to_eur is not None:
+                active_usd_to_eur = float(
+                    st.session_state.last_ecb_usd_to_eur
+                )
+                rate_date = st.session_state.last_ecb_rate_date
+                rate_source = "Dernier taux BCE mémorisé"
+                st.warning(
+                    "La BCE est momentanément inaccessible. Le dernier "
+                    f"taux mémorisé du {rate_date} est utilisé."
+                )
+            else:
+                st.warning(
+                    "La BCE est momentanément inaccessible. Le taux manuel "
+                    "enregistré dans Paramètres est utilisé."
+                )
+    else:
+        active_usd_to_eur = st.number_input(
+            "Taux manuel : valeur de 1 dollar en euros",
+            min_value=0.0,
+            value=float(st.session_state.usd_to_eur),
+            step=0.0001,
+            format="%.6f",
+            key="director_manual_rate",
+        )
+
+    st.caption(
+        f"Source utilisée : {rate_source}. Le taux BCE est un taux de "
+        "référence quotidien et peut différer du taux réellement appliqué "
+        "par la banque."
+    )
 
     input1, input2 = st.columns(2)
     revenue_usd = input1.number_input(
@@ -994,7 +1101,7 @@ elif page == "🏢 Directeur de branche":
         ] = 0
         branch_responsables = financial_columns(branch_responsables)
 
-    revenue_eur = revenue_usd * float(st.session_state.usd_to_eur)
+    revenue_eur = revenue_usd * active_usd_to_eur
     charges_eur = revenue_eur * float(st.session_state.charges_rate) / 100
     creator_cost = float(branch_creators["Total déduction €"].sum())
     consultant_cost = (
