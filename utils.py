@@ -250,10 +250,7 @@ def calculate_creator_rewards(
     """
     result = dataframe.copy()
 
-    creator_rate = CREATOR_RATES.get(
-        creator_level,
-        0.0,
-    )
+    creator_rate = CREATOR_RATES.get(creator_level, 0.0)
 
     rewards = []
     base_rates = []
@@ -265,15 +262,9 @@ def calculate_creator_rewards(
         diamonds = int(row["Diamants"])
         hours = float(row["Heures LIVE"])
         days = int(row["Jours valides"])
+        echelon = normalize_text(row["Statut échelon"])
 
-        echelon = normalize_text(
-            row["Statut échelon"]
-        )
-
-        # ------------------------------------------
-        # ÉLIGIBILITÉ CONSULTANTS / MANAGERS
-        # ------------------------------------------
-
+        # Éligibilité pour les consultants et managers
         hierarchy_ok = (
             diamonds >= 5_000
             and hours >= 20
@@ -285,10 +276,7 @@ def calculate_creator_rewards(
             "Oui" if hierarchy_ok else "Non"
         )
 
-        # ------------------------------------------
-        # MOINS DE 35 000 DIAMANTS
-        # ------------------------------------------
-
+        # Moins de 35 000 diamants
         if diamonds < 35_000:
             rewards.append(0)
             base_rates.append(0.0)
@@ -298,11 +286,8 @@ def calculate_creator_rewards(
             )
             continue
 
-        # ------------------------------------------
-        # ENTRE 35 000 ET 99 999 DIAMANTS
-        # ------------------------------------------
-
-                if diamonds < 100_000:
+        # De 35 000 à 99 999 diamants
+        if diamonds < 100_000:
             is_not_maintained = "non maintenu" in echelon
 
             maintained_or_up = (
@@ -314,30 +299,29 @@ def calculate_creator_rewards(
             )
 
             if maintained_or_up:
-                rewards.append(500)
-                reward_reasons.append(
+                reward = 500
+                reason = (
                     "Prime fixe 35k–100k : maintien ou montée"
                 )
+            elif is_not_maintained:
+                reward = 0
+                reason = (
+                    "Échelon non maintenu : prime refusée"
+                )
             else:
-                rewards.append(0)
+                reward = 0
+                reason = (
+                    "Maintien ou montée non validé"
+                )
 
-                if is_not_maintained:
-                    reward_reasons.append(
-                        "Échelon non maintenu : prime refusée"
-                    )
-                else:
-                    reward_reasons.append(
-                        "Maintien ou montée non validé"
-                    )
-
+            rewards.append(reward)
             base_rates.append(0.0)
             activity_bonuses.append(0.0)
+            reward_reasons.append(reason)
             continue
 
-        # ------------------------------------------
-        # À PARTIR DE 100 000 DIAMANTS
-        # ------------------------------------------
-
+        # À partir de 100 000 diamants :
+        # minimum 20 heures et 8 jours
         activity_minimum_ok = (
             hours >= 20
             and days >= 8
@@ -359,7 +343,7 @@ def calculate_creator_rewards(
         else:
             base_rate = creator_rate
 
-        # Bonus d’activité non cumulable
+        # Bonus activité non cumulable
         if days >= 22 and hours >= 80:
             activity_bonus = 0.010
         elif days >= 15 and hours >= 40:
@@ -371,15 +355,11 @@ def calculate_creator_rewards(
             base_rate + activity_bonus
         )
 
-        final_reward = floor_to_hundred(
-            raw_reward
-        )
+        final_reward = floor_to_hundred(raw_reward)
 
         rewards.append(final_reward)
         base_rates.append(base_rate)
-        activity_bonuses.append(
-            activity_bonus
-        )
+        activity_bonuses.append(activity_bonus)
         reward_reasons.append(
             "Taux de base + bonus activité"
         )
