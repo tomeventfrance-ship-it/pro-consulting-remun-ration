@@ -30,7 +30,7 @@ DEFAULT_VALUES = {
     "revenue_usd": 0.0,
     "usd_to_eur": 0.92,
     "other_expenses": 0.0,
-    "coin_pack_price": 11.30,
+    "coin_pack_price": 11.183,
     "invoice_rate": 0.0084,
     "charges_rate": 24.6,
     "exclusions": [],
@@ -419,7 +419,8 @@ elif page == "⚙️ Paramètres":
             "Prix de 1 000 pièces TikTok (€)",
             min_value=0.0,
             value=float(st.session_state.coin_pack_price),
-            step=0.10,
+            step=0.001,
+            format="%.3f",
         )
         invoice_rate = fin2.number_input(
             "Valeur facture par diamant (€)",
