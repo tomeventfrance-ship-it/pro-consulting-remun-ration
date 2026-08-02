@@ -302,23 +302,33 @@ def calculate_creator_rewards(
         # ENTRE 35 000 ET 99 999 DIAMANTS
         # ------------------------------------------
 
-        if diamonds < 100_000:
+                if diamonds < 100_000:
+            is_not_maintained = "non maintenu" in echelon
+
             maintained_or_up = (
-                "maintien" in echelon
-                or "maintenu" in echelon
-                or "montee" in echelon
+                not is_not_maintained
+                and (
+                    "maintien" in echelon
+                    or "montee" in echelon
+                )
             )
 
             if maintained_or_up:
                 rewards.append(500)
                 reward_reasons.append(
-                    "Prime fixe 35k–100k"
+                    "Prime fixe 35k–100k : maintien ou montée"
                 )
             else:
                 rewards.append(0)
-                reward_reasons.append(
-                    "Échelon non maintenu"
-                )
+
+                if is_not_maintained:
+                    reward_reasons.append(
+                        "Échelon non maintenu : prime refusée"
+                    )
+                else:
+                    reward_reasons.append(
+                        "Maintien ou montée non validé"
+                    )
 
             base_rates.append(0.0)
             activity_bonuses.append(0.0)
