@@ -169,187 +169,215 @@ elif page == "📥 Import Backstage":
 # PAGE PARAMÈTRES
 # --------------------------------------------------
 elif page == "💎 Créateurs":
-
     st.title("💎 Calcul des créateurs")
 
     if st.session_state.backstage_data is None:
-        st.warning("Importez d'abord un export Backstage.")
+        st.warning("Importez d’abord un export Backstage.")
         st.stop()
 
-    creator_level = int(
-        st.session_state.creator_level
+    # Signature permettant de recalculer si le fichier
+    # ou le palier créateurs change.
+    calculation_signature = (
+        st.session_state.backstage_filename,
+        st.session_state.creator_level,
     )
 
-    dataframe = calculate_creator_rewards(
-        st.session_state.backstage_data,
-        creator_level,
-    )
-
-    st.success("Calcul terminé.")
-
-    st.metric(
-        "Nombre de créateurs",
-        len(dataframe),
-    )
-
-    st.dataframe(
-        dataframe,
-        use_container_width=True,
-        hide_index=True,
-    )
-elif page == "⚙️ Paramètres":
-    st.title("⚙️ Paramètres mensuels")
-
-    st.info(
-        "Ces quatre paliers sont indépendants et doivent être "
-        "sélectionnés chaque mois."
-    )
-
-    with st.form("monthly_settings"):
-        st.subheader("Informations générales")
-
-        column1, column2 = st.columns(2)
-
-        with column1:
-            month = st.text_input(
-                "Mois analysé",
-                value=st.session_state.month,
-            )
-
-            revenue_usd = st.number_input(
-                "Chiffre d’affaires Backstage ($)",
-                min_value=0.0,
-                value=float(st.session_state.revenue_usd),
-                step=100.0,
-            )
-
-            usd_to_eur = st.number_input(
-                "Taux de conversion dollar → euro",
-                min_value=0.0,
-                value=float(st.session_state.usd_to_eur),
-                step=0.01,
-                format="%.4f",
-            )
-
-            other_expenses = st.number_input(
-                "Autres dépenses (€)",
-                min_value=0.0,
-                value=float(st.session_state.other_expenses),
-                step=10.0,
-            )
-
-        with column2:
-            creator_level = st.selectbox(
-                "Palier Créateurs atteint",
-                options=[5, 7, 9, 13, 15],
-                index=[5, 7, 9, 13, 15].index(
-                    st.session_state.creator_level
-                ),
-                format_func=lambda value: f"{value} %",
-            )
-
-            consultant_level = st.selectbox(
-                "Palier Consultants atteint",
-                options=[5, 7, 9, 11, 13],
-                index=[5, 7, 9, 11, 13].index(
-                    st.session_state.consultant_level
-                ),
-                format_func=lambda value: f"{value} %",
-            )
-
-            manager_level = st.selectbox(
-                "Palier Managers atteint",
-                options=[5, 7, 9, 11, 13],
-                index=[5, 7, 9, 11, 13].index(
-                    st.session_state.manager_level
-                ),
-                format_func=lambda value: f"{value} %",
-            )
-
-            director_level = st.selectbox(
-                "Palier Directeur atteint",
-                options=[4, 5, 7, 8, 10, 11, 13],
-                index=[4, 5, 7, 8, 10, 11, 13].index(
-                    st.session_state.director_level
-                ),
-                format_func=lambda value: f"{value} %",
-            )
-
-        st.subheader("Paramètres financiers")
-
-        column3, column4, column5 = st.columns(3)
-
-        with column3:
-            coin_pack_price = st.number_input(
-                "Prix de 1 000 pièces TikTok (€)",
-                min_value=0.0,
-                value=float(st.session_state.coin_pack_price),
-                step=0.10,
-                format="%.2f",
-            )
-
-        with column4:
-            invoice_rate = st.number_input(
-                "Valeur facture par diamant (€)",
-                min_value=0.0,
-                value=float(st.session_state.invoice_rate),
-                step=0.0001,
-                format="%.4f",
-            )
-
-        with column5:
-            charges_rate = st.number_input(
-                "Charges sur le CA (%)",
-                min_value=0.0,
-                max_value=100.0,
-                value=float(st.session_state.charges_rate),
-                step=0.1,
-                format="%.1f",
-            )
-
-        save_button = st.form_submit_button(
-            "💾 Enregistrer les paramètres",
-            type="primary",
-            use_container_width=True,
+    if (
+        "creator_results" not in st.session_state
+        or st.session_state.get("creator_signature")
+        != calculation_signature
+    ):
+        creator_results = calculate_creator_rewards(
+            st.session_state.backstage_data,
+            int(st.session_state.creator_level),
         )
 
-    if save_button:
-        st.session_state.month = month
-        st.session_state.creator_level = creator_level
-        st.session_state.consultant_level = consultant_level
-        st.session_state.manager_level = manager_level
-        st.session_state.director_level = director_level
-        st.session_state.revenue_usd = revenue_usd
-        st.session_state.usd_to_eur = usd_to_eur
-        st.session_state.other_expenses = other_expenses
-        st.session_state.coin_pack_price = coin_pack_price
-        st.session_state.invoice_rate = invoice_rate
-        st.session_state.charges_rate = charges_rate
+        creator_results["Mode paiement"] = "Diamants"
 
-        st.success("Les paramètres mensuels ont été enregistrés.")
+        st.session_state.creator_results = creator_results
+        st.session_state.creator_signature = calculation_signature
+
+    creator_results = st.session_state.creator_results.copy()
+
+    # --------------------------------------------------
+    # INDICATEURS
+    # --------------------------------------------------
+
+    total_creators = len(creator_results)
+
+    rewarded_creators = int(
+        (creator_results["Rémunération 💎"] > 0).sum()
+    )
+
+    total_reward_diamonds = int(
+        creator_results["Rémunération 💎"].sum()
+    )
+
+    hierarchy_creators = int(
+        (creator_results["Compté hiérarchie"] == "Oui").sum()
+    )
+
+    metric1, metric2, metric3, metric4 = st.columns(4)
+
+    metric1.metric(
+        "Créateurs importés",
+        total_creators,
+    )
+
+    metric2.metric(
+        "Créateurs rémunérés",
+        rewarded_creators,
+    )
+
+    metric3.metric(
+        "Total rémunérations",
+        f"{total_reward_diamonds:,.0f} 💎",
+    )
+
+    metric4.metric(
+        "Comptés pour la hiérarchie",
+        hierarchy_creators,
+    )
 
     st.divider()
 
-    st.subheader("Récapitulatif actuel")
+    # --------------------------------------------------
+    # CHOIX DU MODE DE PAIEMENT
+    # --------------------------------------------------
 
-    summary1, summary2, summary3, summary4 = st.columns(4)
+    st.subheader("Modes de paiement")
 
-    summary1.metric(
-        "Palier Créateurs",
-        f"{st.session_state.creator_level} %",
+    payment_table = creator_results[
+        [
+            "Pseudo",
+            "Groupe",
+            "Agent",
+            "Diamants",
+            "Rémunération 💎",
+            "Mode paiement",
+        ]
+    ].copy()
+
+    edited_payment_table = st.data_editor(
+        payment_table,
+        use_container_width=True,
+        hide_index=True,
+        disabled=[
+            "Pseudo",
+            "Groupe",
+            "Agent",
+            "Diamants",
+            "Rémunération 💎",
+        ],
+        column_config={
+            "Mode paiement": st.column_config.SelectboxColumn(
+                "Mode paiement",
+                options=[
+                    "Diamants",
+                    "Facture €",
+                ],
+                required=True,
+            ),
+            "Diamants": st.column_config.NumberColumn(
+                "Diamants générés",
+                format="%d 💎",
+            ),
+            "Rémunération 💎": st.column_config.NumberColumn(
+                "Rémunération",
+                format="%d 💎",
+            ),
+        },
+        key="creator_payment_editor",
     )
 
-    summary2.metric(
-        "Palier Consultants",
-        f"{st.session_state.consultant_level} %",
+    # Enregistrement des choix dans le tableau principal
+    creator_results["Mode paiement"] = (
+        edited_payment_table["Mode paiement"].values
     )
 
-    summary3.metric(
-        "Palier Managers",
-        f"{st.session_state.manager_level} %",
+    # --------------------------------------------------
+    # CONVERSIONS FINANCIÈRES
+    # --------------------------------------------------
+
+    coin_price = (
+        float(st.session_state.coin_pack_price) / 1000
     )
 
-    summary4.metric(
-        "Palier Directeur",
-        f"{st.session_state.director_level} %",
+    invoice_rate = float(
+        st.session_state.invoice_rate
     )
+
+    creator_results["Facture €"] = creator_results.apply(
+        lambda row: int(
+            row["Rémunération 💎"] * invoice_rate
+        )
+        if row["Mode paiement"] == "Facture €"
+        else 0,
+        axis=1,
+    )
+
+    creator_results["Coût diamants €"] = creator_results.apply(
+        lambda row: round(
+            row["Rémunération 💎"] * coin_price,
+            2,
+        )
+        if row["Mode paiement"] == "Diamants"
+        else 0.0,
+        axis=1,
+    )
+
+    creator_results["Total déduction €"] = (
+        creator_results["Facture €"]
+        + creator_results["Coût diamants €"]
+    )
+
+    st.session_state.creator_results = creator_results
+
+    # --------------------------------------------------
+    # RÉCAPITULATIF FINANCIER
+    # --------------------------------------------------
+
+    total_invoices = int(
+        creator_results["Facture €"].sum()
+    )
+
+    total_coin_cost = float(
+        creator_results["Coût diamants €"].sum()
+    )
+
+    total_deduction = float(
+        creator_results["Total déduction €"].sum()
+    )
+
+    st.subheader("Récapitulatif financier")
+
+    total1, total2, total3 = st.columns(3)
+
+    total1.metric(
+        "Total factures",
+        f"{total_invoices:,.0f} €",
+    )
+
+    total2.metric(
+        "Coût des diamants",
+        f"{total_coin_cost:,.2f} €",
+    )
+
+    total3.metric(
+        "Déduction totale",
+        f"{total_deduction:,.2f} €",
+    )
+
+    # --------------------------------------------------
+    # TABLEAU COMPLET
+    # --------------------------------------------------
+
+    with st.expander(
+        "Afficher le détail complet des calculs",
+        expanded=False,
+    ):
+        st.dataframe(
+            creator_results,
+            use_container_width=True,
+            hide_index=True,
+        )
