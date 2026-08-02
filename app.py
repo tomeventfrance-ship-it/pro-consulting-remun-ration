@@ -542,17 +542,18 @@ elif page == "👥 Consultants":
     consultant_results["Mode paiement"] = (
         edited_payment_table["Mode paiement"].values
     )
-consultant_results["Inclure dans le calcul"] = (
-    edited_payment_table["Inclure dans le calcul"].values
-)
 
-consultant_results.loc[
-    consultant_results["Inclure dans le calcul"] == "Non",
-    [
-        "Taux",
-        "Rémunération 💎",
-    ],
-] = 0
+    consultant_results["Inclure dans le calcul"] = (
+        edited_payment_table["Inclure dans le calcul"].values
+    )
+
+    consultant_results.loc[
+        consultant_results["Inclure dans le calcul"] == "Non",
+        [
+            "Taux",
+            "Rémunération 💎",
+        ],
+    ] = 0
 
     # --------------------------------------------------
     # CONVERSIONS FINANCIÈRES
