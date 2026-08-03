@@ -273,7 +273,7 @@ AUTHORIZED_USERS = {
         "role": "director",
         "direction": "Direction Biker",
     },
-    "max-pro-consulting@outlook.fr": {
+    "melvynschmidt2013@gmail.com": {
         "name": "Max",
         "role": "director",
         "direction": "Direction Max",
@@ -293,7 +293,25 @@ AUTHORIZED_USERS = {
 
 def authentication_is_configured():
     try:
-        return "auth" in st.secrets
+        if "auth" not in st.secrets:
+            return False
+
+        auth = st.secrets["auth"]
+        if "google" not in auth:
+            return False
+
+        google = auth["google"]
+        return all(
+            auth.get(key)
+            for key in ("redirect_uri", "cookie_secret")
+        ) and all(
+            google.get(key)
+            for key in (
+                "client_id",
+                "client_secret",
+                "server_metadata_url",
+            )
+        )
     except (FileNotFoundError, KeyError):
         return False
 
@@ -305,19 +323,12 @@ def login_screen():
         "Connectez-vous avec l’adresse professionnelle autorisée pour "
         "accéder aux calculs de votre direction."
     )
-    google_column, microsoft_column = st.columns(2)
-    google_column.button(
+    st.button(
         "Continuer avec Google",
         on_click=st.login,
         args=["google"],
         use_container_width=True,
         type="primary",
-    )
-    microsoft_column.button(
-        "Continuer avec Microsoft",
-        on_click=st.login,
-        args=["microsoft"],
-        use_container_width=True,
     )
 
 
@@ -327,7 +338,7 @@ if not authentication_is_configured():
         "Secrets Streamlit."
     )
     st.info(
-        "Ajoutez la configuration Google et Microsoft dans les Secrets de "
+        "Ajoutez la configuration Google dans les Secrets de "
         "l’application, puis redémarrez-la."
     )
     st.stop()
