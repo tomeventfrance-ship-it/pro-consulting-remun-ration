@@ -262,26 +262,147 @@ def show_financial_summary(dataframe):
     )
 
 
+AUTHORIZED_USERS = {
+    "tomeventfrance@gmail.com": {
+        "name": "Thomas",
+        "role": "admin",
+        "direction": "Administration",
+    },
+    "a.stone.authorbusiness@gmail.com": {
+        "name": "Biker",
+        "role": "director",
+        "direction": "Direction Biker",
+    },
+    "max-pro-consulting@outlook.fr": {
+        "name": "Max",
+        "role": "director",
+        "direction": "Direction Max",
+    },
+    "moon441330@gmail.com": {
+        "name": "Moon",
+        "role": "director",
+        "direction": "Direction Moon",
+    },
+    "vividirectrice@gmail.com": {
+        "name": "Vivi",
+        "role": "director",
+        "direction": "Direction Vivi",
+    },
+}
+
+
+def authentication_is_configured():
+    try:
+        return "auth" in st.secrets
+    except (FileNotFoundError, KeyError):
+        return False
+
+
+def login_screen():
+    st.title("💎 Pro Consulting")
+    st.subheader("Connexion sécurisée")
+    st.write(
+        "Connectez-vous avec l’adresse professionnelle autorisée pour "
+        "accéder aux calculs de votre direction."
+    )
+    google_column, microsoft_column = st.columns(2)
+    google_column.button(
+        "Continuer avec Google",
+        on_click=st.login,
+        args=["google"],
+        use_container_width=True,
+        type="primary",
+    )
+    microsoft_column.button(
+        "Continuer avec Microsoft",
+        on_click=st.login,
+        args=["microsoft"],
+        use_container_width=True,
+    )
+
+
+if not authentication_is_configured():
+    st.error(
+        "La connexion sécurisée n’est pas encore configurée dans les "
+        "Secrets Streamlit."
+    )
+    st.info(
+        "Ajoutez la configuration Google et Microsoft dans les Secrets de "
+        "l’application, puis redémarrez-la."
+    )
+    st.stop()
+
+if not st.user.is_logged_in:
+    login_screen()
+    st.stop()
+
+user_claims = st.user.to_dict()
+current_user_email = normalize_email(
+    user_claims.get("email")
+    or user_claims.get("preferred_username")
+    or user_claims.get("upn")
+)
+current_user_access = AUTHORIZED_USERS.get(current_user_email)
+
+if current_user_access is None:
+    st.error(
+        "Accès refusé : cette adresse n’est pas autorisée à utiliser "
+        "Pro Consulting."
+    )
+    if current_user_email:
+        st.code(current_user_email)
+    st.button(
+        "Se déconnecter",
+        on_click=st.logout,
+        use_container_width=True,
+    )
+    st.stop()
+
+current_user_role = current_user_access["role"]
+current_user_name = current_user_access["name"]
+current_user_direction = current_user_access["direction"]
+
+
 st.sidebar.title("💎 Pro Consulting")
+st.sidebar.success(f"Connecté : {current_user_name}")
+st.sidebar.caption(current_user_direction)
+st.sidebar.button(
+    "🚪 Se déconnecter",
+    on_click=st.logout,
+    use_container_width=True,
+)
+
+admin_pages = [
+    "🏠 Accueil",
+    "📥 Import Backstage",
+    "⚙️ Paramètres",
+    "🛡️ Administration",
+    "💎 Créateurs",
+    "👥 Consultants",
+    "📈 Responsables performance",
+    "🏢 Directeur de branche",
+]
+
+director_pages = [
+    "🏠 Accueil",
+    "📥 Import Backstage",
+    "⚙️ Paramètres",
+    "💎 Créateurs",
+    "👥 Consultants",
+    "📈 Responsables performance",
+    "🏢 Directeur de branche",
+]
 
 page = st.sidebar.radio(
     "Navigation",
-    [
-        "🏠 Accueil",
-        "📥 Import Backstage",
-        "⚙️ Paramètres",
-        "🛡️ Administration",
-        "💎 Créateurs",
-        "👥 Consultants",
-        "📈 Responsables performance",
-        "🏢 Directeur de branche",
-    ],
+    admin_pages if current_user_role == "admin" else director_pages,
 )
 
 
 if page == "🏠 Accueil":
     st.title("💎 Pro Consulting")
     st.subheader("Calcul des rémunérations")
+    st.write(f"Bienvenue **{current_user_name}** — {current_user_direction}")
 
     if st.session_state.backstage_data is None:
         st.info("Aucun export Backstage n’a encore été importé.")
@@ -474,6 +595,10 @@ elif page == "⚙️ Paramètres":
 
 
 elif page == "🛡️ Administration":
+    if current_user_role != "admin":
+        st.error("Cette page est réservée à l’administrateur.")
+        st.stop()
+
     st.title("🛡️ Administration des exclusions")
     st.write(
         "Ajoutez, modifiez ou supprimez une adresse à tout moment. "
