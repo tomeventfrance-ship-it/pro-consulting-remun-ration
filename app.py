@@ -498,6 +498,15 @@ elif page == "⚙️ Paramètres":
         "sélectionnés chaque mois."
     )
 
+    financial_settings_locked = current_user_role != "admin"
+
+    if financial_settings_locked:
+        st.caption(
+            "🔒 Les paramètres financiers sont définis par "
+            "l’administrateur et ne peuvent pas être modifiés par "
+            "un directeur."
+        )
+
     with st.form("monthly_parameters"):
         left, right = st.columns(2)
 
@@ -561,6 +570,7 @@ elif page == "⚙️ Paramètres":
             value=float(st.session_state.coin_pack_price),
             step=0.001,
             format="%.3f",
+            disabled=financial_settings_locked,
         )
         invoice_rate = fin2.number_input(
             "Valeur facture par diamant (€)",
@@ -568,6 +578,7 @@ elif page == "⚙️ Paramètres":
             value=float(st.session_state.invoice_rate),
             step=0.0001,
             format="%.4f",
+            disabled=financial_settings_locked,
         )
         charges_rate = fin3.number_input(
             "Charges sur le CA (%)",
@@ -575,6 +586,7 @@ elif page == "⚙️ Paramètres":
             max_value=100.0,
             value=float(st.session_state.charges_rate),
             step=0.1,
+            disabled=financial_settings_locked,
         )
 
         save_parameters = st.form_submit_button(
@@ -595,9 +607,13 @@ elif page == "⚙️ Paramètres":
         st.session_state.consultant_level = consultant_level
         st.session_state.manager_level = manager_level
         st.session_state.director_level = director_level
-        st.session_state.coin_pack_price = coin_pack_price
-        st.session_state.invoice_rate = invoice_rate
-        st.session_state.charges_rate = charges_rate
+        # Double protection : même si le formulaire est manipulé côté
+        # navigateur, seuls les administrateurs peuvent enregistrer les
+        # paramètres financiers.
+        if current_user_role == "admin":
+            st.session_state.coin_pack_price = coin_pack_price
+            st.session_state.invoice_rate = invoice_rate
+            st.session_state.charges_rate = charges_rate
 
         if old_levels != (creator_level, consultant_level):
             reset_calculations()
