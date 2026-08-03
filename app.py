@@ -1,6 +1,7 @@
 import pandas as pd
 import streamlit as st
 from datetime import datetime
+from html import escape
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
@@ -17,6 +18,350 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+st.markdown(
+    """
+    <style>
+    :root {
+        --pc-lagoon: #19a8a8;
+        --pc-lagoon-light: #74d8d2;
+        --pc-teal: #075e63;
+        --pc-teal-deep: #06373d;
+        --pc-sand: #d9b978;
+        --pc-gold: #efce88;
+        --pc-cream: #f7f1e5;
+        --pc-ink: #082f35;
+        --pc-panel: rgba(9, 66, 73, 0.72);
+        --pc-border: rgba(239, 206, 136, 0.24);
+    }
+
+    [data-testid="stAppViewContainer"] {
+        background:
+            radial-gradient(circle at 86% 8%, rgba(25, 168, 168, 0.18), transparent 30%),
+            radial-gradient(circle at 10% 92%, rgba(217, 185, 120, 0.12), transparent 28%),
+            linear-gradient(145deg, #082f35 0%, #0b464c 48%, #0c5558 100%);
+        color: var(--pc-cream);
+    }
+
+    [data-testid="stHeader"] {
+        background: transparent;
+    }
+
+    [data-testid="stDecoration"] {
+        background: linear-gradient(90deg, var(--pc-lagoon), var(--pc-gold));
+    }
+
+    .block-container {
+        max-width: 1480px;
+        padding-top: 2rem;
+        padding-bottom: 4rem;
+    }
+
+    h1, h2, h3 {
+        color: var(--pc-cream) !important;
+        letter-spacing: -0.025em;
+    }
+
+    h1 {
+        font-weight: 780 !important;
+    }
+
+    h2, h3 {
+        font-weight: 700 !important;
+    }
+
+    a {
+        color: var(--pc-lagoon-light) !important;
+    }
+
+    [data-testid="stSidebar"] {
+        background:
+            radial-gradient(circle at 22% 6%, rgba(116, 216, 210, 0.14), transparent 25%),
+            linear-gradient(180deg, #06373d 0%, #075158 58%, #0a676a 100%);
+        border-right: 1px solid rgba(239, 206, 136, 0.22);
+    }
+
+    [data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+        padding-top: 1.15rem;
+    }
+
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] span {
+        color: var(--pc-cream) !important;
+    }
+
+    [data-testid="stSidebar"] [role="radiogroup"] label {
+        border: 1px solid transparent;
+        border-radius: 12px;
+        margin: 0.18rem 0;
+        padding: 0.46rem 0.6rem;
+        transition: all 0.2s ease;
+    }
+
+    [data-testid="stSidebar"] [role="radiogroup"] label:hover {
+        background: rgba(255, 255, 255, 0.08);
+        border-color: rgba(116, 216, 210, 0.28);
+        transform: translateX(2px);
+    }
+
+    [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {
+        background: linear-gradient(90deg, rgba(25, 168, 168, 0.28), rgba(239, 206, 136, 0.14));
+        border-color: rgba(239, 206, 136, 0.36);
+        box-shadow: inset 3px 0 0 var(--pc-gold);
+    }
+
+    [data-testid="stMetric"] {
+        height: 100%;
+        padding: 1.05rem 1.15rem;
+        border: 1px solid var(--pc-border);
+        border-radius: 17px;
+        background: linear-gradient(145deg, rgba(255, 255, 255, 0.085), rgba(255, 255, 255, 0.035));
+        box-shadow: 0 12px 30px rgba(0, 30, 35, 0.18);
+        backdrop-filter: blur(14px);
+    }
+
+    [data-testid="stMetricLabel"] {
+        color: var(--pc-lagoon-light) !important;
+        font-weight: 650;
+    }
+
+    [data-testid="stMetricValue"] {
+        color: var(--pc-gold) !important;
+        font-weight: 760;
+    }
+
+    [data-testid="stForm"],
+    [data-testid="stExpander"] {
+        border: 1px solid var(--pc-border) !important;
+        border-radius: 18px !important;
+        background: linear-gradient(145deg, rgba(255, 255, 255, 0.065), rgba(255, 255, 255, 0.025));
+        box-shadow: 0 14px 34px rgba(0, 25, 30, 0.16);
+    }
+
+    [data-testid="stForm"] {
+        padding: 1.25rem 1.35rem;
+    }
+
+    [data-testid="stFileUploaderDropzone"] {
+        border: 1px dashed rgba(116, 216, 210, 0.5);
+        border-radius: 16px;
+        background: rgba(7, 94, 99, 0.28);
+    }
+
+    [data-baseweb="input"] > div,
+    [data-baseweb="select"] > div,
+    [data-baseweb="textarea"] > div {
+        border-color: rgba(116, 216, 210, 0.25) !important;
+        border-radius: 11px !important;
+        background-color: rgba(255, 255, 255, 0.065) !important;
+    }
+
+    [data-baseweb="input"] input,
+    [data-baseweb="select"] input,
+    [data-baseweb="textarea"] textarea {
+        color: var(--pc-cream) !important;
+    }
+
+    [data-testid="stNumberInput"] button {
+        color: var(--pc-gold) !important;
+        border-color: rgba(239, 206, 136, 0.2) !important;
+        background: rgba(255, 255, 255, 0.035) !important;
+    }
+
+    .stButton > button,
+    .stDownloadButton > button,
+    [data-testid="stFormSubmitButton"] > button {
+        min-height: 2.75rem;
+        border: 1px solid rgba(239, 206, 136, 0.55) !important;
+        border-radius: 12px !important;
+        background: linear-gradient(105deg, #d9b978 0%, #f2d99e 52%, #74d8d2 140%) !important;
+        color: var(--pc-ink) !important;
+        font-weight: 760 !important;
+        box-shadow: 0 8px 22px rgba(0, 32, 36, 0.22);
+        transition: transform 0.18s ease, box-shadow 0.18s ease;
+    }
+
+    .stButton > button:hover,
+    .stDownloadButton > button:hover,
+    [data-testid="stFormSubmitButton"] > button:hover {
+        border-color: var(--pc-cream) !important;
+        transform: translateY(-1px);
+        box-shadow: 0 11px 26px rgba(0, 32, 36, 0.28);
+    }
+
+    .stButton > button:disabled,
+    [data-testid="stFormSubmitButton"] > button:disabled {
+        opacity: 0.55;
+        transform: none;
+    }
+
+    [data-testid="stAlert"] {
+        border-radius: 14px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        box-shadow: 0 8px 22px rgba(0, 28, 32, 0.12);
+    }
+
+    [data-testid="stDataFrame"],
+    [data-testid="stDataEditor"] {
+        overflow: hidden;
+        border: 1px solid var(--pc-border);
+        border-radius: 16px;
+        box-shadow: 0 14px 34px rgba(0, 25, 30, 0.18);
+    }
+
+    hr {
+        border-color: rgba(239, 206, 136, 0.18) !important;
+    }
+
+    .pc-hero {
+        position: relative;
+        overflow: hidden;
+        margin: 0 0 1.55rem;
+        padding: 2.25rem 2.4rem;
+        border: 1px solid rgba(239, 206, 136, 0.38);
+        border-radius: 24px;
+        background:
+            radial-gradient(circle at 90% 18%, rgba(247, 241, 229, 0.2), transparent 24%),
+            linear-gradient(118deg, rgba(6, 55, 61, 0.98) 0%, rgba(7, 110, 114, 0.96) 58%, rgba(217, 185, 120, 0.88) 145%);
+        box-shadow: 0 24px 52px rgba(0, 24, 28, 0.27);
+    }
+
+    .pc-hero::after {
+        content: "◆";
+        position: absolute;
+        right: 3.2rem;
+        top: 50%;
+        color: rgba(247, 241, 229, 0.16);
+        font-size: 7rem;
+        line-height: 1;
+        transform: translateY(-50%) rotate(45deg);
+    }
+
+    .pc-hero-kicker {
+        margin-bottom: 0.55rem;
+        color: var(--pc-gold);
+        font-size: 0.78rem;
+        font-weight: 800;
+        letter-spacing: 0.17em;
+        text-transform: uppercase;
+    }
+
+    .pc-hero h1 {
+        position: relative;
+        z-index: 1;
+        margin: 0 0 0.55rem;
+        max-width: 820px;
+        color: #fffaf0 !important;
+        font-size: clamp(2rem, 4vw, 3.3rem);
+        line-height: 1.05;
+    }
+
+    .pc-hero p {
+        position: relative;
+        z-index: 1;
+        max-width: 780px;
+        margin: 0;
+        color: rgba(247, 241, 229, 0.88);
+        font-size: 1.04rem;
+        line-height: 1.6;
+    }
+
+    .pc-sidebar-brand {
+        margin: 0.2rem 0 1rem;
+        padding: 1rem 1.05rem;
+        border: 1px solid rgba(239, 206, 136, 0.3);
+        border-radius: 17px;
+        background: linear-gradient(145deg, rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.035));
+        box-shadow: 0 12px 28px rgba(0, 27, 31, 0.18);
+    }
+
+    .pc-sidebar-logo {
+        color: #fffaf0;
+        font-size: 1.3rem;
+        font-weight: 820;
+        letter-spacing: -0.025em;
+    }
+
+    .pc-sidebar-logo span {
+        color: var(--pc-gold) !important;
+    }
+
+    .pc-sidebar-tagline {
+        margin-top: 0.25rem;
+        color: rgba(247, 241, 229, 0.7) !important;
+        font-size: 0.76rem;
+        letter-spacing: 0.04em;
+    }
+
+    .pc-user-card {
+        margin: 0 0 0.8rem;
+        padding: 0.85rem 0.95rem;
+        border-left: 3px solid var(--pc-gold);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.055);
+    }
+
+    .pc-user-card strong {
+        display: block;
+        color: #fffaf0;
+        font-size: 0.98rem;
+    }
+
+    .pc-user-card span {
+        display: block;
+        margin-top: 0.15rem;
+        color: rgba(247, 241, 229, 0.7) !important;
+        font-size: 0.78rem;
+    }
+
+    .pc-user-status {
+        margin-bottom: 0.4rem;
+        color: var(--pc-lagoon-light) !important;
+        font-size: 0.72rem;
+        font-weight: 760;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+    }
+
+    @media (max-width: 760px) {
+        .block-container {
+            padding: 1rem 0.85rem 3rem;
+        }
+
+        .pc-hero {
+            padding: 1.5rem 1.3rem;
+            border-radius: 19px;
+        }
+
+        .pc-hero::after {
+            right: 1rem;
+            font-size: 4.4rem;
+        }
+
+        .pc-hero p {
+            padding-right: 1.4rem;
+            font-size: 0.94rem;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def render_brand_hero(title, subtitle, kicker="PRO CONSULTING"):
+    st.markdown(
+        f"""
+        <section class="pc-hero">
+            <div class="pc-hero-kicker">{escape(kicker)}</div>
+            <h1>{escape(title)}</h1>
+            <p>{escape(subtitle)}</p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 DEFAULT_VALUES = {
@@ -317,11 +662,11 @@ def authentication_is_configured():
 
 
 def login_screen():
-    st.title("💎 Pro Consulting")
-    st.subheader("Connexion sécurisée")
-    st.write(
-        "Connectez-vous avec l’adresse professionnelle autorisée pour "
-        "accéder aux calculs de votre direction."
+    render_brand_hero(
+        "Connexion sécurisée",
+        "Accédez à votre espace de calcul avec l’adresse professionnelle "
+        "autorisée pour votre direction.",
+        "PRO CONSULTING • ESPACE PRIVÉ",
     )
     st.button(
         "Continuer avec Google",
@@ -374,9 +719,25 @@ current_user_name = current_user_access["name"]
 current_user_direction = current_user_access["direction"]
 
 
-st.sidebar.title("💎 Pro Consulting")
-st.sidebar.success(f"Connecté : {current_user_name}")
-st.sidebar.caption(current_user_direction)
+st.sidebar.markdown(
+    """
+    <div class="pc-sidebar-brand">
+        <div class="pc-sidebar-logo"><span>◆</span> Pro Consulting</div>
+        <div class="pc-sidebar-tagline">Pilotage & rémunérations</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+st.sidebar.markdown(
+    f"""
+    <div class="pc-user-card">
+        <div class="pc-user-status">● Connecté</div>
+        <strong>{escape(current_user_name)}</strong>
+        <span>{escape(current_user_direction)}</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 st.sidebar.button(
     "🚪 Se déconnecter",
     on_click=st.logout,
@@ -411,8 +772,12 @@ page = st.sidebar.radio(
 
 
 if page == "🏠 Accueil":
-    st.title("💎 Pro Consulting")
-    st.subheader("Calcul des rémunérations")
+    render_brand_hero(
+        "Pilotez vos rémunérations",
+        "Importez les données Backstage, contrôlez chaque niveau de "
+        "rémunération et obtenez une vision claire de votre branche.",
+        "PRO CONSULTING • TABLEAU DE BORD",
+    )
     st.write(f"Bienvenue **{current_user_name}** — {current_user_direction}")
 
     if st.session_state.backstage_data is None:
