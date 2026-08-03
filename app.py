@@ -242,13 +242,21 @@ def calculate_responsable_rewards(
 
 def show_financial_summary(dataframe):
     st.subheader("Récapitulatif financier")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total factures", f"{dataframe['Facture €'].sum():,.0f} €")
-    col2.metric(
+    diamond_total = dataframe.loc[
+        dataframe["Mode paiement"] == "Diamants",
+        "Rémunération 💎",
+    ].sum()
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric(
+        "Total à payer en diamants",
+        f"{diamond_total:,.0f} 💎",
+    )
+    col2.metric("Total factures", f"{dataframe['Facture €'].sum():,.0f} €")
+    col3.metric(
         "Coût des diamants",
         f"{dataframe['Coût diamants €'].sum():,.2f} €",
     )
-    col3.metric(
+    col4.metric(
         "Déduction totale",
         f"{dataframe['Total déduction €'].sum():,.2f} €",
     )
@@ -591,26 +599,22 @@ elif page == "💎 Créateurs":
             st.session_state.backstage_data,
             int(st.session_state.creator_level),
         )
+        creator_results["Rémunération calculée 💎"] = creator_results[
+            "Rémunération 💎"
+        ]
+        creator_results["Inclure rémunération créateur"] = "Oui"
         creator_results["Mode paiement"] = "Diamants"
         st.session_state.creator_results = creator_results
         st.session_state.creator_signature = creator_signature
 
     creator_results = st.session_state.creator_results.copy()
 
-    metric1, metric2, metric3, metric4 = st.columns(4)
-    metric1.metric("Créateurs importés", len(creator_results))
-    metric2.metric(
-        "Créateurs rémunérés",
-        int((creator_results["Rémunération 💎"] > 0).sum()),
-    )
-    metric3.metric(
-        "Total rémunérations",
-        f"{creator_results['Rémunération 💎'].sum():,.0f} 💎",
-    )
-    metric4.metric(
-        "Comptés pour la hiérarchie",
-        int((creator_results["Compté hiérarchie"] == "Oui").sum()),
-    )
+    if "Rémunération calculée 💎" not in creator_results.columns:
+        creator_results["Rémunération calculée 💎"] = creator_results[
+            "Rémunération 💎"
+        ]
+    if "Inclure rémunération créateur" not in creator_results.columns:
+        creator_results["Inclure rémunération créateur"] = "Oui"
 
     st.divider()
     payment_table = creator_results[
@@ -619,6 +623,7 @@ elif page == "💎 Créateurs":
             "Groupe",
             "Agent",
             "Diamants",
+            "Inclure rémunération créateur",
             "Rémunération 💎",
             "Mode paiement",
         ]
@@ -636,6 +641,18 @@ elif page == "💎 Créateurs":
             "Rémunération 💎",
         ],
         column_config={
+            "Inclure rémunération créateur": (
+                st.column_config.SelectboxColumn(
+                    "Rémunérer le créateur",
+                    options=["Oui", "Non"],
+                    required=True,
+                    help=(
+                        "Choisissez Non pour un créateur parti. Cela annule "
+                        "uniquement sa rémunération personnelle, sans "
+                        "modifier les calculs du consultant ou du responsable."
+                    ),
+                )
+            ),
             "Mode paiement": st.column_config.SelectboxColumn(
                 "Mode paiement",
                 options=["Diamants", "Facture €"],
@@ -648,8 +665,37 @@ elif page == "💎 Créateurs":
     creator_results["Mode paiement"] = edited_payment_table[
         "Mode paiement"
     ].values
+    creator_results["Inclure rémunération créateur"] = (
+        edited_payment_table["Inclure rémunération créateur"].values
+    )
+    creator_results["Rémunération 💎"] = creator_results[
+        "Rémunération calculée 💎"
+    ].where(
+        creator_results["Inclure rémunération créateur"] == "Oui",
+        0,
+    )
     creator_results = financial_columns(creator_results)
     st.session_state.creator_results = creator_results
+
+    diamond_total = creator_results.loc[
+        creator_results["Mode paiement"] == "Diamants",
+        "Rémunération 💎",
+    ].sum()
+    metric1, metric2, metric3, metric4, metric5 = st.columns(5)
+    metric1.metric("Créateurs importés", len(creator_results))
+    metric2.metric(
+        "Créateurs rémunérés",
+        int((creator_results["Rémunération 💎"] > 0).sum()),
+    )
+    metric3.metric("Paiements diamants", f"{diamond_total:,.0f} 💎")
+    metric4.metric(
+        "Paiements factures",
+        f"{creator_results['Facture €'].sum():,.0f} €",
+    )
+    metric5.metric(
+        "Comptés pour la hiérarchie",
+        int((creator_results["Compté hiérarchie"] == "Oui").sum()),
+    )
     show_financial_summary(creator_results)
 
     with st.expander("Afficher le détail complet des calculs"):
@@ -725,21 +771,6 @@ elif page == "👥 Consultants":
         ["Taux", "Rémunération 💎"],
     ] = 0
 
-    metric1, metric2, metric3, metric4 = st.columns(4)
-    metric1.metric("Consultants détectés", len(consultant_results))
-    metric2.metric(
-        "Consultants rémunérés",
-        int((consultant_results["Rémunération 💎"] > 0).sum()),
-    )
-    metric3.metric(
-        "Diamants éligibles",
-        f"{consultant_results.loc[~excluded_mask, 'Diamants éligibles'].sum():,.0f} 💎",
-    )
-    metric4.metric(
-        "Total rémunérations",
-        f"{consultant_results['Rémunération 💎'].sum():,.0f} 💎",
-    )
-
     st.divider()
     payment_table = consultant_results[
         [
@@ -784,6 +815,26 @@ elif page == "👥 Consultants":
     ].values
     consultant_results = financial_columns(consultant_results)
     st.session_state.consultant_results = consultant_results
+
+    diamond_total = consultant_results.loc[
+        consultant_results["Mode paiement"] == "Diamants",
+        "Rémunération 💎",
+    ].sum()
+    metric1, metric2, metric3, metric4, metric5 = st.columns(5)
+    metric1.metric("Consultants détectés", len(consultant_results))
+    metric2.metric(
+        "Consultants rémunérés",
+        int((consultant_results["Rémunération 💎"] > 0).sum()),
+    )
+    metric3.metric(
+        "Diamants éligibles",
+        f"{consultant_results.loc[~excluded_mask, 'Diamants éligibles'].sum():,.0f} 💎",
+    )
+    metric4.metric("Paiements diamants", f"{diamond_total:,.0f} 💎")
+    metric5.metric(
+        "Paiements factures",
+        f"{consultant_results['Facture €'].sum():,.0f} €",
+    )
     show_financial_summary(consultant_results)
 
     with st.expander("Afficher le détail complet"):
@@ -860,21 +911,6 @@ elif page == "📈 Responsables performance":
         ["Taux", "Rémunération 💎"],
     ] = 0
 
-    metric1, metric2, metric3, metric4 = st.columns(4)
-    metric1.metric("Responsables détectés", len(responsable_results))
-    metric2.metric(
-        "Responsables rémunérés",
-        int((responsable_results["Rémunération 💎"] > 0).sum()),
-    )
-    metric3.metric(
-        "Diamants éligibles",
-        f"{responsable_results.loc[~excluded_mask, 'Diamants éligibles'].sum():,.0f} 💎",
-    )
-    metric4.metric(
-        "Total rémunérations",
-        f"{responsable_results['Rémunération 💎'].sum():,.0f} 💎",
-    )
-
     st.divider()
     payment_table = responsable_results[
         [
@@ -919,6 +955,26 @@ elif page == "📈 Responsables performance":
     ].values
     responsable_results = financial_columns(responsable_results)
     st.session_state.responsable_results = responsable_results
+
+    diamond_total = responsable_results.loc[
+        responsable_results["Mode paiement"] == "Diamants",
+        "Rémunération 💎",
+    ].sum()
+    metric1, metric2, metric3, metric4, metric5 = st.columns(5)
+    metric1.metric("Responsables détectés", len(responsable_results))
+    metric2.metric(
+        "Responsables rémunérés",
+        int((responsable_results["Rémunération 💎"] > 0).sum()),
+    )
+    metric3.metric(
+        "Diamants éligibles",
+        f"{responsable_results.loc[~excluded_mask, 'Diamants éligibles'].sum():,.0f} 💎",
+    )
+    metric4.metric("Paiements diamants", f"{diamond_total:,.0f} 💎")
+    metric5.metric(
+        "Paiements factures",
+        f"{responsable_results['Facture €'].sum():,.0f} €",
+    )
     show_financial_summary(responsable_results)
 
     with st.expander("Afficher le détail complet"):
@@ -1075,6 +1131,16 @@ elif page == "🏢 Directeur de branche":
     )
     if not branch_consultants.empty:
         branch_consultants["Mode paiement"] = "Diamants"
+        if "consultant_results" in st.session_state:
+            saved_consultant_modes = (
+                st.session_state.consultant_results
+                .drop_duplicates("Consultant")
+                .set_index("Consultant")["Mode paiement"]
+                .to_dict()
+            )
+            branch_consultants["Mode paiement"] = branch_consultants[
+                "Consultant"
+            ].map(saved_consultant_modes).fillna("Diamants")
         consultant_exclusions = excluded_emails("consultants")
         consultant_excluded_mask = branch_consultants["Consultant"].map(
             lambda value: normalize_email(value) in consultant_exclusions
@@ -1092,6 +1158,16 @@ elif page == "🏢 Directeur de branche":
     )
     if not branch_responsables.empty:
         branch_responsables["Mode paiement"] = "Diamants"
+        if "responsable_results" in st.session_state:
+            saved_responsable_modes = (
+                st.session_state.responsable_results
+                .drop_duplicates("Responsable performance")
+                .set_index("Responsable performance")["Mode paiement"]
+                .to_dict()
+            )
+            branch_responsables["Mode paiement"] = branch_responsables[
+                "Responsable performance"
+            ].map(saved_responsable_modes).fillna("Diamants")
         responsable_exclusions = excluded_emails("responsables")
         responsable_excluded_mask = branch_responsables[
             "Responsable performance"
