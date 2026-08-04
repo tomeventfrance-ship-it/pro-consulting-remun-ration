@@ -1,4 +1,7 @@
+import json
+
 import pandas as pd
+import psycopg
 import streamlit as st
 from datetime import datetime
 from html import escape
@@ -397,9 +400,140 @@ DEFAULT_VALUES = {
     "last_ecb_rate_date": None,
 }
 
+GLOBAL_FINANCIAL_KEYS = (
+    "coin_pack_price",
+    "invoice_rate",
+    "charges_rate",
+)
+
+BRANCH_PARAMETER_KEYS = (
+    "month",
+    "creator_level",
+    "consultant_level",
+    "manager_level",
+    "director_level",
+    "revenue_usd",
+    "usd_to_eur",
+    "other_expenses",
+    "director_branch_revenue_usd",
+    "director_branch_other_expenses",
+    "use_ecb_rate",
+)
+
 for key, default_value in DEFAULT_VALUES.items():
     if key not in st.session_state:
         st.session_state[key] = default_value
+
+
+def get_database_url():
+    """Retourne l'URL PostgreSQL stockée dans les Secrets Streamlit."""
+    try:
+        if "database" not in st.secrets:
+            return None
+
+        database = st.secrets["database"]
+        database_url = str(database.get("url", "")).strip()
+        return database_url or None
+    except (FileNotFoundError, KeyError, TypeError):
+        return None
+
+
+@st.cache_resource(show_spinner=False)
+def initialize_settings_database(database_url):
+    """Crée la table de réglages persistants si elle n'existe pas."""
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pro_consulting_settings (
+                    scope TEXT PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_by TEXT NOT NULL
+                )
+                """
+            )
+        connection.commit()
+
+    return True
+
+
+def load_persistent_scope(database_url, scope):
+    """Charge un bloc de paramètres depuis PostgreSQL."""
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT payload
+                FROM pro_consulting_settings
+                WHERE scope = %s
+                """,
+                (scope,),
+            )
+            row = cursor.fetchone()
+
+    if row is None:
+        return {}
+
+    payload = row[0]
+    if isinstance(payload, str):
+        return json.loads(payload)
+    return dict(payload)
+
+
+def save_persistent_scopes(database_url, scopes, updated_by):
+    """Enregistre plusieurs blocs de paramètres dans une transaction."""
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            for scope, payload in scopes.items():
+                cursor.execute(
+                    """
+                    INSERT INTO pro_consulting_settings (
+                        scope,
+                        payload,
+                        updated_by
+                    )
+                    VALUES (%s, %s::jsonb, %s)
+                    ON CONFLICT (scope)
+                    DO UPDATE SET
+                        payload = EXCLUDED.payload,
+                        updated_at = CURRENT_TIMESTAMP,
+                        updated_by = EXCLUDED.updated_by
+                    """,
+                    (
+                        scope,
+                        json.dumps(payload, ensure_ascii=False),
+                        updated_by,
+                    ),
+                )
+        connection.commit()
+
+
+def branch_settings_scope(user_email):
+    """Chaque direction conserve ses propres paramètres mensuels."""
+    return f"branch:{normalize_email(user_email)}"
+
+
+def apply_persistent_settings(database_url, user_email):
+    """Recharge les réglages communs et ceux de la direction connectée."""
+    initialize_settings_database(database_url)
+
+    global_settings = load_persistent_scope(
+        database_url,
+        "global:financial",
+    )
+    branch_settings = load_persistent_scope(
+        database_url,
+        branch_settings_scope(user_email),
+    )
+
+    for key in GLOBAL_FINANCIAL_KEYS:
+        if key in global_settings:
+            st.session_state[key] = global_settings[key]
+
+    for key in BRANCH_PARAMETER_KEYS:
+        if key in branch_settings:
+            st.session_state[key] = branch_settings[key]
 
 
 def normalize_email(value):
@@ -729,6 +863,32 @@ current_user_role = current_user_access["role"]
 current_user_name = current_user_access["name"]
 current_user_direction = current_user_access["direction"]
 
+database_url = get_database_url()
+persistent_settings_available = database_url is not None
+persistent_settings_error = None
+
+if persistent_settings_available:
+    try:
+        settings_session_key = f"settings:{current_user_email}"
+        if (
+            st.session_state.get("persistent_settings_loaded_for")
+            != settings_session_key
+        ):
+            apply_persistent_settings(
+                database_url,
+                current_user_email,
+            )
+            st.session_state.persistent_settings_loaded_for = (
+                settings_session_key
+            )
+    except Exception:
+        persistent_settings_available = False
+        persistent_settings_error = (
+            "La base de paramètres est momentanément indisponible. "
+            "Les valeurs de cette session restent utilisables, mais elles "
+            "ne seront pas sauvegardées après la déconnexion."
+        )
+
 
 st.sidebar.markdown(
     """
@@ -874,6 +1034,21 @@ elif page == "⚙️ Paramètres":
         "sélectionnés chaque mois."
     )
 
+    if persistent_settings_available:
+        st.success(
+            "☁️ Sauvegarde permanente active : les paramètres de votre "
+            "direction seront retrouvés après une déconnexion ou un "
+            "redémarrage de l’application."
+        )
+    elif persistent_settings_error:
+        st.warning(persistent_settings_error)
+    else:
+        st.warning(
+            "La sauvegarde permanente n’est pas encore configurée. "
+            "Les paramètres seront conservés uniquement pendant cette "
+            "session."
+        )
+
     financial_settings_locked = current_user_role != "admin"
 
     if financial_settings_locked:
@@ -991,10 +1166,51 @@ elif page == "⚙️ Paramètres":
             st.session_state.invoice_rate = invoice_rate
             st.session_state.charges_rate = charges_rate
 
+        permanent_save_succeeded = False
+        permanent_save_error = None
+
+        if persistent_settings_available:
+            scopes_to_save = {
+                branch_settings_scope(current_user_email): {
+                    key: st.session_state[key]
+                    for key in BRANCH_PARAMETER_KEYS
+                }
+            }
+
+            if current_user_role == "admin":
+                scopes_to_save["global:financial"] = {
+                    key: st.session_state[key]
+                    for key in GLOBAL_FINANCIAL_KEYS
+                }
+
+            try:
+                save_persistent_scopes(
+                    database_url,
+                    scopes_to_save,
+                    current_user_email,
+                )
+                permanent_save_succeeded = True
+            except Exception:
+                permanent_save_error = (
+                    "L’enregistrement permanent a échoué. Les valeurs "
+                    "restent disponibles dans la session actuelle."
+                )
+
         if old_levels != (creator_level, consultant_level):
             reset_calculations()
 
-        st.success("Les paramètres mensuels ont été enregistrés.")
+        if permanent_save_succeeded:
+            st.success(
+                "Les paramètres ont été enregistrés définitivement."
+            )
+        elif permanent_save_error:
+            st.error(permanent_save_error)
+        else:
+            st.warning(
+                "Les paramètres ont été enregistrés uniquement pour la "
+                "session actuelle. Configurez la base permanente pour les "
+                "retrouver après une déconnexion."
+            )
 
 
 elif page == "🛡️ Administration":
