@@ -652,6 +652,11 @@ def exclusions_scope(user_email):
     return f"exclusions:{normalize_email(user_email)}"
 
 
+def director_management_scope():
+    """Configuration privée des quatre directions, gérée par Thomas."""
+    return "admin:director_management"
+
+
 def apply_persistent_settings(database_url, user_email):
     """Recharge les réglages communs et ceux de la direction connectée."""
     initialize_settings_database(database_url)
@@ -876,6 +881,30 @@ def financial_columns(dataframe):
     return result
 
 
+def combined_payment_totals(*dataframes):
+    """Additionne les paiements en diamants et en factures."""
+    diamond_total = 0.0
+    diamond_cost = 0.0
+    invoice_total = 0.0
+
+    for dataframe in dataframes:
+        if dataframe is None or dataframe.empty:
+            continue
+
+        diamond_rows = dataframe["Mode paiement"] == "Diamants"
+        diamond_total += float(
+            dataframe.loc[diamond_rows, "Rémunération 💎"].sum()
+        )
+        diamond_cost += float(dataframe["Coût diamants €"].sum())
+        invoice_total += float(dataframe["Facture €"].sum())
+
+    return {
+        "diamonds": diamond_total,
+        "diamond_cost": diamond_cost,
+        "invoices": invoice_total,
+    }
+
+
 RESPONSABLE_RATES = {
     5: 0.010,
     7: 0.015,
@@ -990,6 +1019,195 @@ def calculate_responsable_rewards(
     return result
 
 
+def calculate_director_branch_finances(
+    all_creator_results,
+    selected_groups,
+    revenue_usd,
+    other_expenses,
+    usd_to_eur,
+):
+    """Calcule une branche sans modifier les résultats des créateurs."""
+    branch_creators = all_creator_results[
+        all_creator_results["Groupe"].isin(selected_groups)
+    ].copy()
+    if "Mode paiement" not in branch_creators.columns:
+        branch_creators["Mode paiement"] = "Diamants"
+    branch_creators = financial_columns(branch_creators)
+
+    branch_consultants = calculate_consultant_rewards(
+        creator_results=branch_creators,
+        consultant_level=int(st.session_state.consultant_level),
+        minimum_team_diamonds=200_000,
+    )
+    if not branch_consultants.empty:
+        branch_consultants["Mode paiement"] = "Diamants"
+        if "consultant_results" in st.session_state:
+            saved_consultant_modes = (
+                st.session_state.consultant_results
+                .drop_duplicates("Consultant")
+                .set_index("Consultant")["Mode paiement"]
+                .to_dict()
+            )
+            branch_consultants["Mode paiement"] = branch_consultants[
+                "Consultant"
+            ].map(saved_consultant_modes).fillna("Diamants")
+        consultant_exclusions = excluded_emails("consultants")
+        consultant_excluded_mask = branch_consultants["Consultant"].map(
+            lambda value: normalize_email(value) in consultant_exclusions
+        )
+        branch_consultants.loc[
+            consultant_excluded_mask,
+            ["Taux", "Rémunération 💎"],
+        ] = 0
+        branch_consultants = financial_columns(branch_consultants)
+
+    branch_responsables = calculate_responsable_rewards(
+        creator_results=branch_creators,
+        responsable_level=int(st.session_state.manager_level),
+        minimum_group_diamonds=600_000,
+    )
+    if not branch_responsables.empty:
+        branch_responsables["Mode paiement"] = "Diamants"
+        if "responsable_results" in st.session_state:
+            saved_responsable_modes = (
+                st.session_state.responsable_results
+                .drop_duplicates("Responsable performance")
+                .set_index("Responsable performance")["Mode paiement"]
+                .to_dict()
+            )
+            branch_responsables["Mode paiement"] = branch_responsables[
+                "Responsable performance"
+            ].map(saved_responsable_modes).fillna("Diamants")
+        responsable_exclusions = excluded_emails("responsables")
+        responsable_excluded_mask = branch_responsables[
+            "Responsable performance"
+        ].map(lambda value: normalize_email(value) in responsable_exclusions)
+        branch_responsables.loc[
+            responsable_excluded_mask,
+            ["Taux", "Rémunération 💎"],
+        ] = 0
+        branch_responsables = financial_columns(branch_responsables)
+
+    revenue_eur = float(revenue_usd) * float(usd_to_eur)
+    charges_eur = (
+        revenue_eur * float(st.session_state.charges_rate) / 100
+    )
+    creator_cost = float(branch_creators["Total déduction €"].sum())
+    consultant_cost = (
+        float(branch_consultants["Total déduction €"].sum())
+        if not branch_consultants.empty
+        else 0.0
+    )
+    responsable_cost = (
+        float(branch_responsables["Total déduction €"].sum())
+        if not branch_responsables.empty
+        else 0.0
+    )
+    net_profit_before_director = max(
+        0.0,
+        revenue_eur
+        - charges_eur
+        - creator_cost
+        - consultant_cost
+        - responsable_cost
+        - float(other_expenses),
+    )
+    director_rate = DIRECTOR_RATES.get(
+        int(st.session_state.director_level),
+        0.0,
+    )
+    director_reward = net_profit_before_director * director_rate
+
+    return {
+        "creators": branch_creators,
+        "consultants": branch_consultants,
+        "responsables": branch_responsables,
+        "diamonds_generated": float(branch_creators["Diamants"].sum()),
+        "revenue_eur": revenue_eur,
+        "charges_eur": charges_eur,
+        "creator_cost": creator_cost,
+        "consultant_cost": consultant_cost,
+        "responsable_cost": responsable_cost,
+        "net_profit_before_director": net_profit_before_director,
+        "director_rate": director_rate,
+        "director_reward": director_reward,
+        "remaining_after_director": (
+            net_profit_before_director - director_reward
+        ),
+    }
+
+
+def build_director_overview(
+    all_creator_results,
+    director_config,
+    usd_to_eur,
+):
+    """Construit la synthèse financière des quatre directions."""
+    director_rows = []
+
+    for profile in DIRECTOR_MANAGEMENT_PROFILES:
+        email = profile["email"]
+        direction_config = director_config[email]
+        selected_groups = direction_config["groups"]
+
+        if selected_groups:
+            branch_result = calculate_director_branch_finances(
+                all_creator_results=all_creator_results,
+                selected_groups=selected_groups,
+                revenue_usd=direction_config["revenue_usd"],
+                other_expenses=direction_config["other_expenses"],
+                usd_to_eur=usd_to_eur,
+            )
+        else:
+            branch_result = {
+                "diamonds_generated": 0.0,
+                "revenue_eur": 0.0,
+                "charges_eur": 0.0,
+                "creator_cost": 0.0,
+                "consultant_cost": 0.0,
+                "responsable_cost": 0.0,
+                "net_profit_before_director": 0.0,
+                "director_rate": DIRECTOR_RATES.get(
+                    int(st.session_state.director_level),
+                    0.0,
+                ),
+                "director_reward": 0.0,
+                "remaining_after_director": 0.0,
+            }
+
+        director_rows.append(
+            {
+                "Directeur": profile["name"],
+                "Direction": profile["direction"],
+                "Groupes gérés": ", ".join(selected_groups) or "Aucun",
+                "Diamants générés": branch_result["diamonds_generated"],
+                "CA branche ($)": direction_config["revenue_usd"],
+                "CA converti (€)": branch_result["revenue_eur"],
+                "Charges (€)": branch_result["charges_eur"],
+                "Coût créateurs (€)": branch_result["creator_cost"],
+                "Coût consultants (€)": branch_result["consultant_cost"],
+                "Coût responsables (€)": branch_result[
+                    "responsable_cost"
+                ],
+                "Autres dépenses (€)": direction_config[
+                    "other_expenses"
+                ],
+                "Bénéfice avant directeur (€)": branch_result[
+                    "net_profit_before_director"
+                ],
+                "Taux directeur": branch_result["director_rate"] * 100,
+                "Montant facture directeur (€)": branch_result[
+                    "director_reward"
+                ],
+                "Bénéfice restant (€)": branch_result[
+                    "remaining_after_director"
+                ],
+            }
+        )
+
+    return pd.DataFrame(director_rows)
+
+
 def show_financial_summary(dataframe):
     st.subheader("Récapitulatif financier")
     diamond_total = dataframe.loc[
@@ -1039,6 +1257,77 @@ AUTHORIZED_USERS = {
         "direction": "Direction Vivi",
     },
 }
+
+DIRECTOR_MANAGEMENT_PROFILES = (
+    {
+        "email": "a.stone.authorbusiness@gmail.com",
+        "name": "Biker",
+        "direction": "Direction Biker",
+    },
+    {
+        "email": "melvynschmidt2013@gmail.com",
+        "name": "Max",
+        "direction": "Direction Max",
+    },
+    {
+        "email": "moon441330@gmail.com",
+        "name": "Moon",
+        "direction": "Direction Moon",
+    },
+    {
+        "email": "vividirectrice@gmail.com",
+        "name": "Vivi",
+        "direction": "Direction Vivi",
+    },
+)
+
+
+def default_director_management_config():
+    return {
+        profile["email"]: {
+            "groups": [],
+            "revenue_usd": 0.0,
+            "other_expenses": 0.0,
+        }
+        for profile in DIRECTOR_MANAGEMENT_PROFILES
+    }
+
+
+def clean_director_management_config(payload, available_groups):
+    """Nettoie les affectations enregistrées avant leur utilisation."""
+    def non_negative_number(value):
+        try:
+            return max(0.0, float(value or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    available_group_set = set(available_groups)
+    payload = payload if isinstance(payload, dict) else {}
+    cleaned_config = default_director_management_config()
+
+    for profile in DIRECTOR_MANAGEMENT_PROFILES:
+        email = profile["email"]
+        saved_row = payload.get(email, {})
+        saved_row = saved_row if isinstance(saved_row, dict) else {}
+        saved_groups = saved_row.get("groups", [])
+        if not isinstance(saved_groups, list):
+            saved_groups = []
+
+        cleaned_config[email] = {
+            "groups": [
+                str(group)
+                for group in saved_groups
+                if str(group) in available_group_set
+            ],
+            "revenue_usd": non_negative_number(
+                saved_row.get("revenue_usd", 0.0)
+            ),
+            "other_expenses": non_negative_number(
+                saved_row.get("other_expenses", 0.0)
+            ),
+        }
+
+    return cleaned_config
 
 
 def authentication_is_configured():
@@ -1135,6 +1424,8 @@ if st.session_state.get("active_user_email") != current_user_email:
     st.session_state.pop("detected_columns", None)
     st.session_state.pop("exclusions_editor", None)
     st.session_state.pop("persistent_settings_loaded_for", None)
+    st.session_state.pop("admin_director_management_loaded", None)
+    st.session_state.pop("admin_director_management_config", None)
     reset_calculations()
     st.session_state.active_user_email = current_user_email
 
@@ -2210,6 +2501,254 @@ elif page == "🏢 Directeur de branche":
         if value and value.lower() != "nan"
     )
 
+    if current_user_role == "admin":
+        st.info(
+            "Cet espace privé vous permet d’affecter les groupes aux "
+            "quatre directeurs et d’afficher leurs factures en une seule "
+            "fois. Les directeurs ne voient pas cette vue d’ensemble."
+        )
+
+        if not st.session_state.get("admin_director_management_loaded"):
+            saved_director_config = {}
+            if persistent_settings_available:
+                try:
+                    saved_payload = load_persistent_scope(
+                        database_url,
+                        director_management_scope(),
+                    )
+                    saved_director_config = saved_payload.get(
+                        "directors",
+                        {},
+                    )
+                except Exception:
+                    st.warning(
+                        "Les affectations enregistrées n’ont pas pu être "
+                        "chargées. Vous pouvez poursuivre dans cette session."
+                    )
+
+            st.session_state.admin_director_management_config = (
+                clean_director_management_config(
+                    saved_director_config,
+                    available_groups,
+                )
+            )
+            st.session_state.admin_director_management_loaded = True
+
+        saved_director_config = clean_director_management_config(
+            st.session_state.get(
+                "admin_director_management_config",
+                {},
+            ),
+            available_groups,
+        )
+
+        st.subheader("Taux de conversion quotidien")
+        rate_column, refresh_column = st.columns([3, 1])
+        refresh_director_rate = refresh_column.button(
+            "🔄 Actualiser le taux",
+            key="admin_director_refresh_daily_rate",
+            use_container_width=True,
+        )
+        director_rate_info = resolve_daily_usd_to_eur_rate(
+            database_url=(
+                database_url if persistent_settings_available else None
+            ),
+            updated_by=current_user_email,
+            force_refresh=refresh_director_rate,
+        )
+        rate_column.success(
+            f"Taux du {director_rate_info['date']} : "
+            f"1 $ = {director_rate_info['rate']:.6f} € "
+            f"— {director_rate_info['source']}"
+        )
+        if director_rate_info["warning"]:
+            st.warning(director_rate_info["warning"])
+
+        st.subheader("Affectation des groupes et chiffres d’affaires")
+        edited_director_config = {}
+
+        for profile in DIRECTOR_MANAGEMENT_PROFILES:
+            email = profile["email"]
+            saved_row = saved_director_config[email]
+            key_suffix = re.sub(r"[^a-z0-9]+", "_", profile["name"].lower())
+
+            with st.expander(
+                f"{profile['name']} — {profile['direction']}",
+                expanded=True,
+            ):
+                selected_director_groups = st.multiselect(
+                    "Groupes en gestion",
+                    options=available_groups,
+                    default=saved_row["groups"],
+                    key=f"admin_director_groups_{key_suffix}",
+                )
+                revenue_column, expenses_column = st.columns(2)
+                director_revenue_usd = revenue_column.number_input(
+                    "Chiffre d’affaires de la branche ($)",
+                    min_value=0.0,
+                    value=float(saved_row["revenue_usd"]),
+                    step=100.0,
+                    key=f"admin_director_revenue_{key_suffix}",
+                )
+                director_other_expenses = expenses_column.number_input(
+                    "Autres dépenses de la branche (€)",
+                    min_value=0.0,
+                    value=float(saved_row["other_expenses"]),
+                    step=10.0,
+                    key=f"admin_director_expenses_{key_suffix}",
+                )
+
+            edited_director_config[email] = {
+                "groups": list(selected_director_groups),
+                "revenue_usd": float(director_revenue_usd),
+                "other_expenses": float(director_other_expenses),
+            }
+
+        group_owners = {}
+        for profile in DIRECTOR_MANAGEMENT_PROFILES:
+            for group in edited_director_config[profile["email"]]["groups"]:
+                group_owners.setdefault(group, []).append(profile["name"])
+
+        duplicate_groups = {
+            group: owners
+            for group, owners in group_owners.items()
+            if len(owners) > 1
+        }
+        if duplicate_groups:
+            duplicate_details = "; ".join(
+                f"{group} : {', '.join(owners)}"
+                for group, owners in sorted(duplicate_groups.items())
+            )
+            st.error(
+                "Un groupe ne peut appartenir qu’à un seul directeur. "
+                f"Corrigez les doublons suivants : {duplicate_details}."
+            )
+
+        save_director_config = st.button(
+            "💾 Enregistrer les quatre directions",
+            key="save_admin_director_management",
+            type="primary",
+            use_container_width=True,
+            disabled=bool(duplicate_groups),
+        )
+        if save_director_config:
+            st.session_state.admin_director_management_config = (
+                edited_director_config
+            )
+            if persistent_settings_available:
+                try:
+                    save_persistent_scopes(
+                        database_url,
+                        {
+                            director_management_scope(): {
+                                "directors": edited_director_config,
+                                "saved_at": datetime.now().isoformat(
+                                    timespec="seconds"
+                                ),
+                            }
+                        },
+                        current_user_email,
+                    )
+                    st.success(
+                        "Les groupes, chiffres d’affaires et dépenses des "
+                        "quatre directions sont enregistrés définitivement."
+                    )
+                except Exception:
+                    st.error(
+                        "Les valeurs restent utilisables dans cette session, "
+                        "mais leur sauvegarde permanente a échoué."
+                    )
+            else:
+                st.warning(
+                    "Les valeurs sont conservées uniquement dans cette "
+                    "session car la base permanente n’est pas configurée."
+                )
+
+        if duplicate_groups:
+            st.stop()
+
+        director_overview = build_director_overview(
+            all_creator_results=all_creator_results,
+            director_config=edited_director_config,
+            usd_to_eur=director_rate_info["rate"],
+        )
+        st.divider()
+        st.subheader("Vue d’ensemble des quatre directeurs")
+        overview1, overview2, overview3, overview4 = st.columns(4)
+        overview1.metric(
+            "Groupes attribués",
+            len(group_owners),
+        )
+        overview2.metric(
+            "CA total saisi",
+            f"{director_overview['CA branche ($)'].sum():,.2f} $",
+        )
+        overview3.metric(
+            "CA total converti",
+            f"{director_overview['CA converti (€)'].sum():,.2f} €",
+        )
+        overview4.metric(
+            "Total factures directeurs",
+            f"{director_overview['Montant facture directeur (€)'].sum():,.2f} €",
+        )
+
+        st.dataframe(
+            director_overview,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Diamants générés": st.column_config.NumberColumn(
+                    format="%.0f 💎"
+                ),
+                "CA branche ($)": st.column_config.NumberColumn(
+                    format="%.2f $"
+                ),
+                "CA converti (€)": st.column_config.NumberColumn(
+                    format="%.2f €"
+                ),
+                "Charges (€)": st.column_config.NumberColumn(
+                    format="%.2f €"
+                ),
+                "Coût créateurs (€)": st.column_config.NumberColumn(
+                    format="%.2f €"
+                ),
+                "Coût consultants (€)": st.column_config.NumberColumn(
+                    format="%.2f €"
+                ),
+                "Coût responsables (€)": st.column_config.NumberColumn(
+                    format="%.2f €"
+                ),
+                "Autres dépenses (€)": st.column_config.NumberColumn(
+                    format="%.2f €"
+                ),
+                "Bénéfice avant directeur (€)": (
+                    st.column_config.NumberColumn(format="%.2f €")
+                ),
+                "Taux directeur": st.column_config.NumberColumn(
+                    format="%.1f %%"
+                ),
+                "Montant facture directeur (€)": (
+                    st.column_config.NumberColumn(format="%.2f €")
+                ),
+                "Bénéfice restant (€)": st.column_config.NumberColumn(
+                    format="%.2f €"
+                ),
+            },
+        )
+        show_excel_download(
+            director_overview,
+            table_name="factures_quatre_directeurs",
+            sheet_name="Factures directeurs",
+            key="download_four_directors_overview",
+            label="⬇️ Télécharger la vue des quatre directeurs (Excel)",
+        )
+        st.caption(
+            "Les montants sont recalculés avec le taux BCE affiché et le "
+            "palier Directeur enregistré. Un directeur sans groupe attribué "
+            "reste à 0 € afin d’éviter une facture sans équipe rattachée."
+        )
+        st.stop()
+
     st.subheader("Composition de la branche")
     selected_groups = st.multiselect(
         "Cochez les responsables performance appartenant à cette branche",
@@ -2628,6 +3167,53 @@ elif page == "💰 Bénéfice agence":
         int(st.session_state.director_level),
         0.0,
     )
+
+    available_agency_groups = sorted(
+        value
+        for value in agency_creators["Groupe"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .unique()
+        if value and value.lower() != "nan"
+    )
+    if "admin_director_management_config" not in st.session_state:
+        saved_director_payload = {}
+        if persistent_settings_available:
+            try:
+                saved_director_payload = load_persistent_scope(
+                    database_url,
+                    director_management_scope(),
+                ).get("directors", {})
+            except Exception:
+                st.warning(
+                    "La répartition enregistrée des directeurs n’a pas pu "
+                    "être chargée. L’estimation globale est utilisée."
+                )
+        st.session_state.admin_director_management_config = (
+            clean_director_management_config(
+                saved_director_payload,
+                available_agency_groups,
+            )
+        )
+
+    benefit_director_config = clean_director_management_config(
+        st.session_state.admin_director_management_config,
+        available_agency_groups,
+    )
+    benefit_group_owners = {}
+    for profile in DIRECTOR_MANAGEMENT_PROFILES:
+        for group in benefit_director_config[profile["email"]]["groups"]:
+            benefit_group_owners.setdefault(group, []).append(
+                profile["name"]
+            )
+    benefit_has_duplicate_groups = any(
+        len(owners) > 1 for owners in benefit_group_owners.values()
+    )
+    benefit_has_director_assignments = bool(benefit_group_owners) and not (
+        benefit_has_duplicate_groups
+    )
+
     agency_calculation = calculate_agency_profit(
         revenue_usd=agency_revenue_usd,
         usd_to_eur=agency_rate_info["rate"],
@@ -2643,8 +3229,40 @@ elif page == "💰 Bénéfice agence":
     result_before_directors = agency_calculation[
         "result_before_directors"
     ]
-    directors_reward = agency_calculation["directors_reward"]
-    agency_profit = agency_calculation["agency_profit"]
+    agency_director_overview = pd.DataFrame()
+    if benefit_has_director_assignments:
+        agency_director_overview = build_director_overview(
+            all_creator_results=agency_creators,
+            director_config=benefit_director_config,
+            usd_to_eur=agency_rate_info["rate"],
+        )
+        directors_reward = float(
+            agency_director_overview[
+                "Montant facture directeur (€)"
+            ].sum()
+        )
+        agency_profit = result_before_directors - directors_reward
+        director_invoice_source = "Factures calculées des quatre directions"
+    else:
+        directors_reward = agency_calculation["directors_reward"]
+        agency_profit = agency_calculation["agency_profit"]
+        director_invoice_source = "Estimation globale du palier Directeur"
+
+    if benefit_has_duplicate_groups:
+        st.warning(
+            "Un groupe est attribué à plusieurs directeurs dans une ancienne "
+            "configuration. L’estimation globale est utilisée jusqu’à la "
+            "correction dans l’onglet Directeur de branche."
+        )
+
+    agency_payment_totals = combined_payment_totals(
+        agency_creators,
+        agency_consultants,
+        agency_responsables,
+    )
+    total_invoices_with_directors = (
+        agency_payment_totals["invoices"] + directors_reward
+    )
 
     st.divider()
     st.subheader("Votre résultat agence")
@@ -2661,6 +3279,26 @@ elif page == "💰 Bénéfice agence":
     )
     metric5.metric("Votre bénéfice", f"{agency_profit:,.2f} €")
 
+    st.subheader("Paiements à préparer")
+    payment1, payment2, payment3 = st.columns(3)
+    payment1.metric(
+        "Diamants à recharger",
+        f"{agency_payment_totals['diamonds']:,.0f} 💎",
+    )
+    payment2.metric(
+        "Montant de la recharge",
+        f"{agency_payment_totals['diamond_cost']:,.2f} €",
+    )
+    payment3.metric(
+        "Total des factures",
+        f"{total_invoices_with_directors:,.2f} €",
+    )
+    st.caption(
+        "Le total des factures additionne les factures des créateurs, "
+        "consultants et responsables, ainsi que les factures directeurs. "
+        f"Source directeurs : {director_invoice_source}."
+    )
+
     if agency_profit < 0:
         st.error(
             "Le résultat calculé est négatif : les charges et dépenses "
@@ -2673,9 +3311,9 @@ elif page == "💰 Bénéfice agence":
         )
 
     st.caption(
-        "La rémunération globale des directeurs correspond au palier "
-        "Directeur appliqué au résultat positif avant directeurs. Le taux "
-        "BCE ne modifie jamais la valeur facture par diamant."
+        "Lorsque les groupes des quatre directeurs sont enregistrés, leurs "
+        "factures individuelles remplacent l’estimation globale dans ce "
+        "calcul. Le taux BCE ne modifie jamais la valeur facture par diamant."
     )
 
     agency_summary = pd.DataFrame(
@@ -2690,7 +3328,7 @@ elif page == "💰 Bénéfice agence":
             ),
             ("Autres dépenses agence", -agency_other_expenses),
             ("Résultat avant directeurs", result_before_directors),
-            ("Rémunérations globales des directeurs", -directors_reward),
+            (director_invoice_source, -directors_reward),
             ("Votre bénéfice agence", agency_profit),
         ],
         columns=["Élément", "Montant €"],
@@ -2718,14 +3356,52 @@ elif page == "💰 Bénéfice agence":
             ("Date du taux BCE", agency_rate_info["date"]),
             ("Source du taux", agency_rate_info["source"]),
             ("Palier Directeur (%)", director_rate * 100),
+            ("Source factures directeurs", director_invoice_source),
             ("Charges (%)", st.session_state.charges_rate),
             ("Valeur facture par diamant (€)", st.session_state.invoice_rate),
         ],
         columns=["Paramètre", "Valeur"],
     )
+    agency_payments = pd.DataFrame(
+        [
+            ("Diamants à recharger", agency_payment_totals["diamonds"]),
+            (
+                "Montant de la recharge (€)",
+                agency_payment_totals["diamond_cost"],
+            ),
+            (
+                "Factures créateurs, consultants et responsables (€)",
+                agency_payment_totals["invoices"],
+            ),
+            ("Factures directeurs (€)", directors_reward),
+            ("Total des factures (€)", total_invoices_with_directors),
+        ],
+        columns=["Paiement", "Total"],
+    )
+    if agency_director_overview.empty:
+        agency_director_invoices = pd.DataFrame(
+            [
+                {
+                    "Directeur": "Estimation globale",
+                    "Montant facture directeur (€)": directors_reward,
+                }
+            ]
+        )
+    else:
+        agency_director_invoices = agency_director_overview[
+            [
+                "Directeur",
+                "Direction",
+                "Groupes gérés",
+                "CA branche ($)",
+                "Montant facture directeur (€)",
+            ]
+        ].copy()
     show_workbook_download(
         [
             ("Bénéfice agence", agency_summary),
+            ("Paiements", agency_payments),
+            ("Factures directeurs", agency_director_invoices),
             ("Paramètres", agency_parameters),
             ("Créateurs", agency_creators),
             ("Consultants", agency_consultants),
