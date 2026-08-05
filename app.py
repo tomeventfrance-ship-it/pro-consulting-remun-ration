@@ -8,6 +8,8 @@ import streamlit as st
 from datetime import datetime
 from html import escape
 from io import BytesIO
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.worksheet.datavalidation import DataValidation
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
@@ -450,6 +452,87 @@ def dataframes_to_excel(workbook_tables):
     return output.getvalue()
 
 
+@st.cache_data(show_spinner=False)
+def reward_tracking_to_excel(dataframe):
+    """Crée le suivi avec formules et choix Live/Match compatibles Sheets."""
+    export_dataframe = prepare_excel_dataframe(dataframe)
+    output = BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        export_dataframe.to_excel(
+            writer,
+            index=False,
+            sheet_name="Suivi récompenses",
+        )
+        worksheet = writer.sheets["Suivi récompenses"]
+        worksheet.freeze_panes = "A2"
+        worksheet.sheet_view.showGridLines = False
+
+        header_fill = PatternFill("solid", fgColor="007C86")
+        total_fill = PatternFill("solid", fgColor="FFC857")
+        for cell in worksheet[1]:
+            cell.fill = header_fill
+            cell.font = Font(color="FFFFFF", bold=True)
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
+            )
+        worksheet.row_dimensions[1].height = 34
+
+        data_last_row = len(export_dataframe) + 1
+        if len(export_dataframe):
+            worksheet.auto_filter.ref = f"A1:G{data_last_row}"
+            event_validation = DataValidation(
+                type="list",
+                formula1='"Live,Match"',
+                allow_blank=True,
+            )
+            event_validation.error = "Choisissez Live ou Match."
+            event_validation.errorTitle = "Type d’événement incorrect"
+            worksheet.add_data_validation(event_validation)
+            event_validation.add(f"C2:C{data_last_row}")
+
+            for row_number in range(2, data_last_row + 1):
+                worksheet[f"G{row_number}"] = (
+                    f"=E{row_number}+F{row_number}"
+                )
+                for column_letter in ("E", "F", "G"):
+                    worksheet[f"{column_letter}{row_number}"].number_format = (
+                        "#,##0"
+                    )
+
+            total_row = data_last_row + 1
+            worksheet[f"D{total_row}"] = "TOTAL GÉNÉRAL"
+            for column_letter in ("E", "F", "G"):
+                worksheet[f"{column_letter}{total_row}"] = (
+                    f"=SUM({column_letter}2:{column_letter}{data_last_row})"
+                )
+                worksheet[f"{column_letter}{total_row}"].number_format = (
+                    "#,##0"
+                )
+            for cell in worksheet[total_row]:
+                cell.fill = total_fill
+                cell.font = Font(color="071B25", bold=True)
+
+        column_widths = {
+            "A": 14,
+            "B": 11,
+            "C": 18,
+            "D": 28,
+            "E": 25,
+            "F": 38,
+            "G": 23,
+        }
+        for column_letter, width in column_widths.items():
+            worksheet.column_dimensions[column_letter].width = width
+
+        writer.book.calculation.fullCalcOnLoad = True
+        writer.book.calculation.forceFullCalc = True
+
+    return output.getvalue()
+
+
 def export_filename(table_name):
     """Ajoute automatiquement la direction et le mois au nom du fichier."""
     direction = globals().get("current_user_direction", "direction")
@@ -657,6 +740,17 @@ def director_management_scope():
     return "admin:director_management"
 
 
+def reward_tracking_scope(month):
+    """Le suivi mensuel est collectif pour toute la structure."""
+    return ":".join(
+        [
+            "shared",
+            "reward_tracking",
+            safe_export_name(month),
+        ]
+    )
+
+
 def apply_persistent_settings(database_url, user_email):
     """Recharge les réglages communs et ceux de la direction connectée."""
     initialize_settings_database(database_url)
@@ -830,6 +924,157 @@ def clean_exclusions(rows):
     return cleaned
 
 
+REWARD_TRACKING_COLUMNS = [
+    "Date",
+    "Heure",
+    "Type d’événement",
+    "Créateur",
+    "Récompense créateur",
+    "Rémunération consultant / responsable",
+    "Total récompense",
+]
+
+
+def clean_reward_tracking_rows(rows):
+    """Valide le suivi avant affichage, calcul ou sauvegarde."""
+    cleaned_rows = []
+    rows = rows if isinstance(rows, list) else []
+
+    def clean_text(value):
+        text = str(value or "").strip()
+        return "" if text.lower() == "nan" else text
+
+    def clean_reward(value):
+        try:
+            return max(0, int(round(float(value or 0))))
+        except (TypeError, ValueError):
+            return 0
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        creator = clean_text(row.get("Créateur", ""))
+        if not creator:
+            continue
+
+        event_type = clean_text(row.get("Type d’événement", ""))
+        if event_type not in {"Live", "Match"}:
+            event_type = ""
+
+        creator_reward = clean_reward(
+            row.get("Récompense créateur", 0)
+        )
+        hierarchy_reward = clean_reward(
+            row.get("Rémunération consultant / responsable", 0)
+        )
+        cleaned_rows.append(
+            {
+                "Date": clean_text(row.get("Date", "")),
+                "Heure": clean_text(row.get("Heure", "")),
+                "Type d’événement": event_type,
+                "Créateur": creator,
+                "Récompense créateur": creator_reward,
+                "Rémunération consultant / responsable": hierarchy_reward,
+                "Total récompense": creator_reward + hierarchy_reward,
+            }
+        )
+
+    return cleaned_rows
+
+
+def build_reward_tracking_table(creator_results, saved_rows=None):
+    """Fusionne les créateurs calculés avec les champs manuels sauvegardés."""
+    saved_by_creator = {}
+    for saved_row in clean_reward_tracking_rows(saved_rows or []):
+        saved_by_creator.setdefault(saved_row["Créateur"], []).append(
+            saved_row
+        )
+
+    tracking_rows = []
+    for _, creator_row in creator_results.iterrows():
+        creator = str(creator_row.get("Pseudo", "") or "").strip()
+        if not creator or creator.lower() == "nan":
+            continue
+
+        saved_candidates = saved_by_creator.get(creator, [])
+        saved_row = saved_candidates.pop(0) if saved_candidates else {}
+        try:
+            creator_reward = max(
+                0,
+                int(round(float(creator_row.get("Rémunération 💎", 0)))),
+            )
+        except (TypeError, ValueError):
+            creator_reward = 0
+
+        hierarchy_reward = clean_reward_tracking_rows(
+            [
+                {
+                    "Créateur": creator,
+                    "Rémunération consultant / responsable": saved_row.get(
+                        "Rémunération consultant / responsable",
+                        0,
+                    ),
+                }
+            ]
+        )[0]["Rémunération consultant / responsable"]
+
+        tracking_rows.append(
+            {
+                "Date": saved_row.get("Date", ""),
+                "Heure": saved_row.get("Heure", ""),
+                "Type d’événement": saved_row.get(
+                    "Type d’événement",
+                    "",
+                ),
+                "Créateur": creator,
+                "Récompense créateur": creator_reward,
+                "Rémunération consultant / responsable": hierarchy_reward,
+                "Total récompense": creator_reward + hierarchy_reward,
+            }
+        )
+
+    # Les lignes des autres directions restent visibles dans le tableau
+    # collectif même si leur créateur n’est pas présent dans l’import local.
+    for remaining_rows in saved_by_creator.values():
+        tracking_rows.extend(remaining_rows)
+
+    return pd.DataFrame(tracking_rows, columns=REWARD_TRACKING_COLUMNS)
+
+
+def synchronize_reward_tracking_editor():
+    """Recalcule le total dès qu’une cellule manuelle est modifiée."""
+    current_table = st.session_state.get("reward_tracking_table")
+    editor_state = st.session_state.get("reward_tracking_editor", {})
+    if not isinstance(current_table, pd.DataFrame):
+        return
+    if not isinstance(editor_state, dict):
+        return
+
+    updated_table = current_table.copy().reset_index(drop=True)
+    editable_columns = {
+        "Date",
+        "Heure",
+        "Type d’événement",
+        "Rémunération consultant / responsable",
+    }
+    for row_index, changes in editor_state.get("edited_rows", {}).items():
+        try:
+            row_number = int(row_index)
+        except (TypeError, ValueError):
+            continue
+        if row_number < 0 or row_number >= len(updated_table):
+            continue
+        for column, value in changes.items():
+            if column in editable_columns:
+                updated_table.at[row_number, column] = value
+
+    st.session_state.reward_tracking_table = pd.DataFrame(
+        clean_reward_tracking_rows(updated_table.to_dict("records")),
+        columns=REWARD_TRACKING_COLUMNS,
+    )
+
+
 def excluded_emails(scope):
     column = {
         "consultants": "Exclure consultants",
@@ -854,6 +1099,11 @@ def reset_calculations():
         "creator_payment_editor",
         "consultant_payment_editor",
         "responsable_payment_editor",
+        "reward_tracking_table",
+        "reward_tracking_signature",
+        "reward_tracking_editor",
+        "reward_tracking_loaded_scope",
+        "reward_tracking_save_notice",
     ):
         st.session_state.pop(key, None)
 
@@ -1330,6 +1580,128 @@ def clean_director_management_config(payload, available_groups):
     return cleaned_config
 
 
+def normalize_group_name(value):
+    """Normalise un nom de groupe pour un contrôle fiable des imports."""
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def validate_director_import_groups(
+    prepared_dataframe,
+    user_email,
+    database_url,
+):
+    """Compare l’import d’un directeur à ses groupes autorisés."""
+    if not database_url:
+        return {
+            "valid": False,
+            "error": (
+                "La base permanente est indisponible : les groupes autorisés "
+                "ne peuvent pas être contrôlés. L’import est bloqué."
+            ),
+            "missing_groups": [],
+            "unexpected_groups": [],
+        }
+
+    profile = next(
+        (
+            item
+            for item in DIRECTOR_MANAGEMENT_PROFILES
+            if item["email"] == normalize_email(user_email)
+        ),
+        None,
+    )
+    if profile is None:
+        return {
+            "valid": False,
+            "error": "Aucune direction n’est associée à ce compte.",
+            "missing_groups": [],
+            "unexpected_groups": [],
+        }
+
+    try:
+        saved_payload = load_persistent_scope(
+            database_url,
+            director_management_scope(),
+        )
+    except Exception:
+        return {
+            "valid": False,
+            "error": (
+                "Les groupes autorisés ne peuvent pas être chargés. "
+                "L’import est bloqué par sécurité."
+            ),
+            "missing_groups": [],
+            "unexpected_groups": [],
+        }
+
+    saved_directors = saved_payload.get("directors", {})
+    saved_direction = saved_directors.get(profile["email"], {})
+    allowed_groups = saved_direction.get("groups", [])
+    allowed_groups = (
+        allowed_groups if isinstance(allowed_groups, list) else []
+    )
+    allowed_by_key = {
+        normalize_group_name(group): str(group).strip()
+        for group in allowed_groups
+        if normalize_group_name(group)
+    }
+
+    if not allowed_by_key:
+        return {
+            "valid": False,
+            "error": (
+                "Aucun groupe n’a encore été attribué à votre direction. "
+                "Demandez à l’administrateur de configurer vos groupes avant "
+                "d’importer le fichier."
+            ),
+            "missing_groups": [],
+            "unexpected_groups": [],
+        }
+
+    imported_groups = (
+        prepared_dataframe["Groupe"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    imported_by_key = {
+        normalize_group_name(group): group
+        for group in imported_groups.unique()
+        if normalize_group_name(group)
+    }
+    ungrouped_creators = int(
+        imported_groups.map(normalize_group_name).eq("").sum()
+    )
+
+    missing_keys = set(allowed_by_key).difference(imported_by_key)
+    unexpected_keys = set(imported_by_key).difference(allowed_by_key)
+    missing_groups = sorted(allowed_by_key[key] for key in missing_keys)
+    unexpected_groups = sorted(
+        imported_by_key[key] for key in unexpected_keys
+    )
+
+    if missing_groups or unexpected_groups or ungrouped_creators:
+        return {
+            "valid": False,
+            "error": (
+                "Le fichier ne correspond pas exactement aux groupes "
+                "attribués à votre direction. L’import est inutilisable."
+            ),
+            "missing_groups": missing_groups,
+            "unexpected_groups": unexpected_groups,
+            "ungrouped_creators": ungrouped_creators,
+        }
+
+    return {
+        "valid": True,
+        "error": None,
+        "missing_groups": [],
+        "unexpected_groups": [],
+        "ungrouped_creators": 0,
+        "allowed_groups": sorted(allowed_by_key.values()),
+    }
+
+
 def authentication_is_configured():
     try:
         if "auth" not in st.secrets:
@@ -1489,6 +1861,7 @@ admin_pages = [
     "💎 Créateurs",
     "👥 Consultants",
     "📈 Responsables performance",
+    "🎁 Suivi récompenses",
     "🏢 Directeur de branche",
     "💰 Bénéfice agence",
 ]
@@ -1501,6 +1874,7 @@ director_pages = [
     "💎 Créateurs",
     "👥 Consultants",
     "📈 Responsables performance",
+    "🎁 Suivi récompenses",
     "🏢 Directeur de branche",
 ]
 
@@ -1556,6 +1930,44 @@ elif page == "📥 Import Backstage":
                 raw_dataframe
             )
 
+            if current_user_role == "director":
+                import_control = validate_director_import_groups(
+                    prepared_dataframe=prepared_dataframe,
+                    user_email=current_user_email,
+                    database_url=(
+                        database_url if persistent_settings_available else None
+                    ),
+                )
+                if not import_control["valid"]:
+                    st.session_state.backstage_data = None
+                    st.session_state.backstage_filename = None
+                    st.session_state.pop("backstage_raw_data", None)
+                    st.session_state.pop("detected_columns", None)
+                    reset_calculations()
+                    st.error(f"⛔ {import_control['error']}")
+                    if import_control["missing_groups"]:
+                        st.warning(
+                            "Groupes manquants : "
+                            + ", ".join(import_control["missing_groups"])
+                        )
+                    if import_control["unexpected_groups"]:
+                        st.warning(
+                            "Groupes non autorisés ou en trop : "
+                            + ", ".join(
+                                import_control["unexpected_groups"]
+                            )
+                        )
+                    if import_control.get("ungrouped_creators", 0):
+                        st.warning(
+                            f"Créateurs sans groupe : "
+                            f"{import_control['ungrouped_creators']}"
+                        )
+                    st.info(
+                        "Aucune donnée de ce fichier n’a été chargée. "
+                        "Corrigez l’export Backstage puis recommencez."
+                    )
+                    st.stop()
+
             is_new_file = (
                 uploaded_file.name != st.session_state.backstage_filename
             )
@@ -1567,7 +1979,13 @@ elif page == "📥 Import Backstage":
             if is_new_file:
                 reset_calculations()
 
-            st.success("L’export Backstage a été lu correctement.")
+            if current_user_role == "director":
+                st.success(
+                    "L’export Backstage correspond exactement aux groupes "
+                    "autorisés pour votre direction."
+                )
+            else:
+                st.success("L’export Backstage a été lu correctement.")
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Créateurs importés", len(prepared_dataframe))
             col2.metric(
@@ -2466,6 +2884,228 @@ elif page == "📈 Responsables performance":
         )
 
 
+elif page == "🎁 Suivi récompenses":
+    st.title("🎁 Suivi collectif des récompenses")
+    st.info(
+        "Ce tableau est commun à l’administration et aux quatre directions. "
+        "Les créateurs et leurs récompenses sont repris automatiquement ; "
+        "les champs de suivi restent modifiables par l’équipe."
+    )
+
+    creator_results_for_tracking = pd.DataFrame(
+        columns=["Pseudo", "Rémunération 💎"]
+    )
+    if st.session_state.backstage_data is not None:
+        creator_signature = (
+            st.session_state.backstage_filename,
+            st.session_state.creator_level,
+        )
+        if (
+            "creator_results" not in st.session_state
+            or st.session_state.get("creator_signature")
+            != creator_signature
+        ):
+            creator_results = calculate_creator_rewards(
+                st.session_state.backstage_data,
+                int(st.session_state.creator_level),
+            )
+            creator_results["Rémunération calculée 💎"] = creator_results[
+                "Rémunération 💎"
+            ]
+            creator_results["Inclure rémunération créateur"] = "Oui"
+            creator_results["Mode paiement"] = "Diamants"
+            st.session_state.creator_results = creator_results
+            st.session_state.creator_signature = creator_signature
+
+        creator_results_for_tracking = (
+            st.session_state.creator_results.copy()
+        )
+
+    tracking_scope = reward_tracking_scope(st.session_state.month)
+    if (
+        st.session_state.get("reward_tracking_loaded_scope")
+        != tracking_scope
+    ):
+        saved_tracking_rows = []
+        if persistent_settings_available:
+            try:
+                saved_tracking_rows = load_persistent_scope(
+                    database_url,
+                    tracking_scope,
+                ).get("rows", [])
+            except Exception:
+                st.warning(
+                    "Le suivi collectif enregistré ne peut pas être chargé "
+                    "pour le moment."
+                )
+
+        st.session_state.reward_tracking_table = (
+            build_reward_tracking_table(
+                creator_results_for_tracking,
+                saved_tracking_rows,
+            )
+        )
+        st.session_state.reward_tracking_loaded_scope = tracking_scope
+        st.session_state.pop("reward_tracking_editor", None)
+    else:
+        st.session_state.reward_tracking_table = (
+            build_reward_tracking_table(
+                creator_results_for_tracking,
+                st.session_state.get(
+                    "reward_tracking_table",
+                    pd.DataFrame(columns=REWARD_TRACKING_COLUMNS),
+                ).to_dict("records"),
+            )
+        )
+
+    tracking_table = st.session_state.reward_tracking_table.copy()
+    if tracking_table.empty:
+        st.warning(
+            "Le suivi collectif est vide. Importez un export Backstage pour "
+            "ajouter automatiquement les créateurs."
+        )
+        st.stop()
+
+    edited_tracking_table = st.data_editor(
+        tracking_table,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        disabled=[
+            "Créateur",
+            "Récompense créateur",
+            "Total récompense",
+        ],
+        column_config={
+            "Date": st.column_config.TextColumn(
+                "Date",
+                help="À compléter manuellement, par exemple 05/08/2026.",
+            ),
+            "Heure": st.column_config.TextColumn(
+                "Heure",
+                help="À compléter manuellement, par exemple 18:30.",
+            ),
+            "Type d’événement": st.column_config.SelectboxColumn(
+                "Type d’événement",
+                options=["", "Live", "Match"],
+                required=False,
+            ),
+            "Créateur": st.column_config.TextColumn("Créateur"),
+            "Récompense créateur": st.column_config.NumberColumn(
+                "Récompense créateur",
+                min_value=0,
+                step=100,
+                format="%d 💎",
+            ),
+            "Rémunération consultant / responsable": (
+                st.column_config.NumberColumn(
+                    "Rémunération consultant / responsable",
+                    min_value=0,
+                    step=100,
+                    format="%d 💎",
+                    help="Montant à saisir manuellement.",
+                )
+            ),
+            "Total récompense": st.column_config.NumberColumn(
+                "Total récompense",
+                min_value=0,
+                step=100,
+                format="%d 💎",
+                help="Calcul automatique et non modifiable.",
+            ),
+        },
+        key="reward_tracking_editor",
+        on_change=synchronize_reward_tracking_editor,
+    )
+
+    cleaned_tracking_rows = clean_reward_tracking_rows(
+        edited_tracking_table.to_dict("records")
+    )
+    cleaned_tracking_table = pd.DataFrame(
+        cleaned_tracking_rows,
+        columns=REWARD_TRACKING_COLUMNS,
+    )
+    st.session_state.reward_tracking_table = cleaned_tracking_table
+
+    total_creator_rewards = int(
+        cleaned_tracking_table["Récompense créateur"].sum()
+    )
+    total_hierarchy_rewards = int(
+        cleaned_tracking_table[
+            "Rémunération consultant / responsable"
+        ].sum()
+    )
+    total_rewards = int(
+        cleaned_tracking_table["Total récompense"].sum()
+    )
+    metric1, metric2, metric3, metric4 = st.columns(4)
+    metric1.metric("Créateurs suivis", len(cleaned_tracking_table))
+    metric2.metric(
+        "Récompenses créateurs",
+        f"{total_creator_rewards:,.0f} 💎",
+    )
+    metric3.metric(
+        "Consultants / responsables",
+        f"{total_hierarchy_rewards:,.0f} 💎",
+    )
+    metric4.metric("Total à envoyer", f"{total_rewards:,.0f} 💎")
+
+    save_column, download_column = st.columns(2)
+    if save_column.button(
+        "💾 Enregistrer le suivi collectif",
+        key="save_collective_reward_tracking",
+        type="primary",
+        use_container_width=True,
+    ):
+        if persistent_settings_available:
+            try:
+                save_persistent_scopes(
+                    database_url,
+                    {
+                        tracking_scope: {
+                            "month": st.session_state.month,
+                            "rows": cleaned_tracking_rows,
+                            "saved_at": datetime.now().isoformat(
+                                timespec="seconds"
+                            ),
+                            "saved_by": current_user_email,
+                        }
+                    },
+                    current_user_email,
+                )
+                st.success(
+                    "Le suivi collectif est enregistré définitivement et "
+                    "restera disponible après déconnexion."
+                )
+            except Exception:
+                st.error(
+                    "La sauvegarde permanente a échoué. Ne fermez pas la "
+                    "session avant d’avoir téléchargé le fichier Excel."
+                )
+        else:
+            st.error(
+                "La base permanente est indisponible : le suivi ne peut pas "
+                "être sécurisé après déconnexion."
+            )
+
+    download_column.download_button(
+        label="⬇️ Télécharger pour Excel / Google Sheets",
+        data=reward_tracking_to_excel(cleaned_tracking_table),
+        file_name=export_filename("suivi_collectif_recompenses"),
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        key="download_collective_reward_tracking",
+        use_container_width=True,
+    )
+    st.caption(
+        "Dans le fichier téléchargé, le choix Live/Match est conservé et "
+        "la colonne Total récompense contient une formule automatique. Le "
+        "fichier .xlsx peut être importé directement dans Google Sheets."
+    )
+
+
 elif page == "🏢 Directeur de branche":
     st.title("🏢 Calcul du directeur de branche")
     show_estimation_notice()
@@ -2505,7 +3145,9 @@ elif page == "🏢 Directeur de branche":
         st.info(
             "Cet espace privé vous permet d’affecter les groupes aux "
             "quatre directeurs et d’afficher leurs factures en une seule "
-            "fois. Les directeurs ne voient pas cette vue d’ensemble."
+            "fois. Ces affectations sécurisent aussi leurs imports : un "
+            "groupe manquant ou non autorisé bloque entièrement le fichier. "
+            "Les directeurs ne voient pas cette vue d’ensemble."
         )
 
         if not st.session_state.get("admin_director_management_loaded"):
