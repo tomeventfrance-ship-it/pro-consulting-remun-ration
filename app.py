@@ -999,13 +999,23 @@ def build_reward_tracking_table(creator_results, saved_rows=None):
 
         saved_candidates = saved_by_creator.get(creator, [])
         saved_row = saved_candidates.pop(0) if saved_candidates else {}
-        try:
-            creator_reward = max(
-                0,
-                int(round(float(creator_row.get("Rémunération 💎", 0)))),
-            )
-        except (TypeError, ValueError):
+        payment_mode = str(
+            creator_row.get("Mode paiement", "Diamants") or "Diamants"
+        ).strip()
+        if payment_mode == "Facture €":
             creator_reward = 0
+        else:
+            try:
+                creator_reward = max(
+                    0,
+                    int(
+                        round(
+                            float(creator_row.get("Rémunération 💎", 0))
+                        )
+                    ),
+                )
+            except (TypeError, ValueError):
+                creator_reward = 0
 
         hierarchy_reward = clean_reward_tracking_rows(
             [
@@ -1822,7 +1832,8 @@ if persistent_settings_available:
     except Exception:
         persistent_settings_available = False
         persistent_settings_error = (
-            "La base de paramètres est momentanément indisponible. "
+            "La section [database] est présente dans les Secrets, mais la "
+            "connexion PostgreSQL échoue actuellement. "
             "Les valeurs de cette session restent utilisables, mais elles "
             "ne seront pas sauvegardées après la déconnexion."
         )
@@ -2889,7 +2900,8 @@ elif page == "🎁 Suivi récompenses":
     st.info(
         "Ce tableau est commun à l’administration et aux quatre directions. "
         "Les créateurs et leurs récompenses sont repris automatiquement ; "
-        "les champs de suivi restent modifiables par l’équipe."
+        "les champs de suivi restent modifiables par l’équipe. Un créateur "
+        "payé en Facture € apparaît automatiquement à 0 💎 dans ce suivi."
     )
 
     creator_results_for_tracking = pd.DataFrame(
@@ -3083,10 +3095,14 @@ elif page == "🎁 Suivi récompenses":
                     "session avant d’avoir téléchargé le fichier Excel."
                 )
         else:
-            st.error(
-                "La base permanente est indisponible : le suivi ne peut pas "
-                "être sécurisé après déconnexion."
-            )
+            if persistent_settings_error:
+                st.error(persistent_settings_error)
+            else:
+                st.error(
+                    "La section [database] avec son URL PostgreSQL est "
+                    "absente des Secrets Streamlit : le suivi ne peut pas "
+                    "être sauvegardé après déconnexion."
+                )
 
     download_column.download_button(
         label="⬇️ Télécharger pour Excel / Google Sheets",
@@ -3301,10 +3317,14 @@ elif page == "🏢 Directeur de branche":
                         "mais leur sauvegarde permanente a échoué."
                     )
             else:
-                st.warning(
-                    "Les valeurs sont conservées uniquement dans cette "
-                    "session car la base permanente n’est pas configurée."
-                )
+                if persistent_settings_error:
+                    st.error(persistent_settings_error)
+                else:
+                    st.warning(
+                        "La section [database] avec son URL PostgreSQL est "
+                        "absente des Secrets Streamlit. Les valeurs restent "
+                        "uniquement dans cette session."
+                    )
 
         if duplicate_groups:
             st.stop()
@@ -3711,10 +3731,14 @@ elif page == "💰 Bénéfice agence":
                     "session, mais sa sauvegarde permanente a échoué."
                 )
         else:
-            st.warning(
-                "Le chiffre d’affaires est conservé uniquement dans cette "
-                "session car la base permanente n’est pas configurée."
-            )
+            if persistent_settings_error:
+                st.error(persistent_settings_error)
+            else:
+                st.warning(
+                    "La section [database] avec son URL PostgreSQL est "
+                    "absente des Secrets Streamlit. Le chiffre d’affaires "
+                    "reste uniquement dans cette session."
+                )
 
     creator_signature = (
         st.session_state.backstage_filename,
