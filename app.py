@@ -534,6 +534,12 @@ GLOBAL_FINANCIAL_KEYS = (
     "charges_rate",
 )
 
+GLOBAL_EXCHANGE_RATE_KEYS = (
+    "usd_to_eur",
+    "last_ecb_usd_to_eur",
+    "last_ecb_rate_date",
+)
+
 BRANCH_PARAMETER_KEYS = (
     "month",
     "creator_level",
@@ -541,7 +547,6 @@ BRANCH_PARAMETER_KEYS = (
     "manager_level",
     "director_level",
     "revenue_usd",
-    "usd_to_eur",
     "other_expenses",
     "director_branch_revenue_usd",
     "director_branch_other_expenses",
@@ -655,6 +660,10 @@ def apply_persistent_settings(database_url, user_email):
         database_url,
         "global:financial",
     )
+    exchange_rate_settings = load_persistent_scope(
+        database_url,
+        "global:exchange_rate",
+    )
     branch_settings = load_persistent_scope(
         database_url,
         branch_settings_scope(user_email),
@@ -667,6 +676,10 @@ def apply_persistent_settings(database_url, user_email):
     for key in GLOBAL_FINANCIAL_KEYS:
         if key in global_settings:
             st.session_state[key] = global_settings[key]
+
+    for key in GLOBAL_EXCHANGE_RATE_KEYS:
+        if key in exchange_rate_settings:
+            st.session_state[key] = exchange_rate_settings[key]
 
     for key in BRANCH_PARAMETER_KEYS:
         if key in branch_settings:
@@ -716,6 +729,75 @@ def fetch_ecb_usd_to_eur_rate():
         raise ValueError("Le taux USD de la BCE est introuvable.")
 
     return 1 / usd_per_eur, rate_date
+
+
+def resolve_daily_usd_to_eur_rate(
+    database_url=None,
+    updated_by=None,
+    force_refresh=False,
+):
+    """Retourne le taux BCE quotidien et mémorise un secours partagé."""
+    if force_refresh:
+        fetch_ecb_usd_to_eur_rate.clear()
+
+    previous_rate_date = st.session_state.get("last_ecb_rate_date")
+
+    try:
+        usd_to_eur, rate_date = fetch_ecb_usd_to_eur_rate()
+        st.session_state.usd_to_eur = float(usd_to_eur)
+        st.session_state.last_ecb_usd_to_eur = float(usd_to_eur)
+        st.session_state.last_ecb_rate_date = rate_date
+
+        persistence_warning = None
+        if database_url and rate_date != previous_rate_date:
+            try:
+                save_persistent_scopes(
+                    database_url,
+                    {
+                        "global:exchange_rate": {
+                            "usd_to_eur": float(usd_to_eur),
+                            "last_ecb_usd_to_eur": float(usd_to_eur),
+                            "last_ecb_rate_date": rate_date,
+                        }
+                    },
+                    updated_by or "automatic-rate-update",
+                )
+            except Exception:
+                persistence_warning = (
+                    "Le taux BCE est utilisable, mais sa copie de secours "
+                    "n’a pas pu être enregistrée dans la base."
+                )
+
+        return {
+            "rate": float(usd_to_eur),
+            "date": rate_date,
+            "source": "Banque centrale européenne",
+            "warning": persistence_warning,
+        }
+    except Exception:
+        remembered_rate = st.session_state.get("last_ecb_usd_to_eur")
+        remembered_date = st.session_state.get("last_ecb_rate_date")
+
+        if remembered_rate is not None:
+            return {
+                "rate": float(remembered_rate),
+                "date": remembered_date or "date inconnue",
+                "source": "Dernier taux BCE mémorisé",
+                "warning": (
+                    "La BCE est momentanément inaccessible. Le dernier "
+                    "taux quotidien mémorisé est utilisé."
+                ),
+            }
+
+        return {
+            "rate": float(st.session_state.usd_to_eur),
+            "date": "date inconnue",
+            "source": "Taux de secours enregistré",
+            "warning": (
+                "La BCE est momentanément inaccessible et aucun taux BCE "
+                "mémorisé n’est disponible."
+            ),
+        }
 
 
 def clean_exclusions(rows):
@@ -811,6 +893,40 @@ DIRECTOR_RATES = {
     11: 0.13,
     13: 0.15,
 }
+
+
+def calculate_agency_profit(
+    revenue_usd,
+    usd_to_eur,
+    charges_rate,
+    creator_cost,
+    consultant_cost,
+    responsable_cost,
+    other_expenses,
+    director_rate,
+):
+    """Calcule le bénéfice agence après toutes les déductions."""
+    revenue_eur = float(revenue_usd) * float(usd_to_eur)
+    charges_eur = revenue_eur * float(charges_rate) / 100
+    result_before_directors = (
+        revenue_eur
+        - charges_eur
+        - float(creator_cost)
+        - float(consultant_cost)
+        - float(responsable_cost)
+        - float(other_expenses)
+    )
+    directors_reward = (
+        max(0.0, result_before_directors) * float(director_rate)
+    )
+
+    return {
+        "revenue_eur": revenue_eur,
+        "charges_eur": charges_eur,
+        "result_before_directors": result_before_directors,
+        "directors_reward": directors_reward,
+        "agency_profit": result_before_directors - directors_reward,
+    }
 
 
 def floor_to_hundred(value):
@@ -1017,6 +1133,7 @@ if st.session_state.get("active_user_email") != current_user_email:
     st.session_state.backstage_filename = None
     st.session_state.pop("backstage_raw_data", None)
     st.session_state.pop("detected_columns", None)
+    st.session_state.pop("exclusions_editor", None)
     st.session_state.pop("persistent_settings_loaded_for", None)
     reset_calculations()
     st.session_state.active_user_email = current_user_email
@@ -1082,6 +1199,7 @@ admin_pages = [
     "👥 Consultants",
     "📈 Responsables performance",
     "🏢 Directeur de branche",
+    "💰 Bénéfice agence",
 ]
 
 director_pages = [
@@ -1224,6 +1342,29 @@ elif page == "⚙️ Paramètres":
             "un directeur."
         )
 
+    st.subheader("Taux dollar → euro quotidien")
+    rate_status_column, rate_refresh_column = st.columns([3, 1])
+    force_rate_refresh = rate_refresh_column.button(
+        "🔄 Actualiser maintenant",
+        key="parameters_refresh_daily_rate",
+        use_container_width=True,
+    )
+    daily_rate_info = resolve_daily_usd_to_eur_rate(
+        database_url=database_url if persistent_settings_available else None,
+        updated_by=current_user_email,
+        force_refresh=force_rate_refresh,
+    )
+    rate_status_column.success(
+        f"Taux du {daily_rate_info['date']} : "
+        f"1 $ = {daily_rate_info['rate']:.6f} €"
+    )
+    rate_status_column.caption(
+        f"Source : {daily_rate_info['source']}. Actualisation automatique "
+        "à partir du dernier taux officiel BCE disponible."
+    )
+    if daily_rate_info["warning"]:
+        st.warning(daily_rate_info["warning"])
+
     with st.form("monthly_parameters"):
         left, right = st.columns(2)
 
@@ -1236,11 +1377,16 @@ elif page == "⚙️ Paramètres":
                 step=100.0,
             )
             usd_to_eur = st.number_input(
-                "Taux de conversion dollar → euro",
+                "Taux dollar → euro utilisé aujourd’hui (BCE)",
                 min_value=0.0,
-                value=float(st.session_state.usd_to_eur),
-                step=0.01,
-                format="%.4f",
+                value=float(daily_rate_info["rate"]),
+                step=0.0001,
+                format="%.6f",
+                disabled=True,
+                help=(
+                    "Ce taux est actualisé automatiquement. Il est "
+                    "indépendant de la valeur facture par diamant."
+                ),
             )
             other_expenses = st.number_input(
                 "Autres dépenses (€)",
@@ -1315,10 +1461,12 @@ elif page == "⚙️ Paramètres":
         old_levels = (
             st.session_state.creator_level,
             st.session_state.consultant_level,
+            st.session_state.manager_level,
+            st.session_state.director_level,
         )
         st.session_state.month = month
         st.session_state.revenue_usd = revenue_usd
-        st.session_state.usd_to_eur = usd_to_eur
+        st.session_state.usd_to_eur = float(daily_rate_info["rate"])
         st.session_state.other_expenses = other_expenses
         st.session_state.creator_level = creator_level
         st.session_state.consultant_level = consultant_level
@@ -1362,7 +1510,12 @@ elif page == "⚙️ Paramètres":
                     "restent disponibles dans la session actuelle."
                 )
 
-        if old_levels != (creator_level, consultant_level):
+        if old_levels != (
+            creator_level,
+            consultant_level,
+            manager_level,
+            director_level,
+        ):
             reset_calculations()
 
         if permanent_save_succeeded:
@@ -1489,7 +1642,10 @@ elif page == "🛡️ Administration":
                 )
             ),
         },
-        key="exclusions_editor",
+        key=(
+            "exclusions_editor_"
+            f"{safe_export_name(current_user_email)}"
+        ),
     )
     show_excel_download(
         edited_exclusions,
@@ -1497,15 +1653,25 @@ elif page == "🛡️ Administration":
         sheet_name="Exclusions",
         key="download_exclusions",
     )
+    st.caption(
+        "Toute modification, y compris la suppression d’une ligne ou de "
+        "la liste complète, est sauvegardée avec le bouton ci-dessous."
+    )
+    pending_exclusions = clean_exclusions(
+        edited_exclusions.to_dict("records")
+    )
+    if pending_exclusions != st.session_state.exclusions:
+        st.warning(
+            "Modifications non enregistrées : cliquez sur le bouton de "
+            "sauvegarde pour les conserver après la déconnexion."
+        )
 
     if st.button(
-        "💾 Enregistrer les exclusions",
+        "💾 Enregistrer les ajouts, modifications et suppressions",
         type="primary",
         use_container_width=True,
     ):
-        cleaned_exclusions = clean_exclusions(
-            edited_exclusions.to_dict("records")
-        )
+        cleaned_exclusions = pending_exclusions
         st.session_state.exclusions = cleaned_exclusions
         st.session_state.pop("consultant_results", None)
         st.session_state.pop("consultant_signature", None)
@@ -1521,14 +1687,27 @@ elif page == "🛡️ Administration":
                     {
                         exclusions_scope(current_user_email): {
                             "rows": cleaned_exclusions,
+                            "saved_at": datetime.now().isoformat(
+                                timespec="seconds"
+                            ),
                         }
                     },
                     current_user_email,
                 )
+                if cleaned_exclusions:
+                    saved_message = (
+                        f"{len(cleaned_exclusions)} exclusion(s) "
+                        "enregistrée(s) définitivement pour votre "
+                        "direction."
+                    )
+                else:
+                    saved_message = (
+                        "Toutes les exclusions ont été supprimées et cette "
+                        "suppression a été enregistrée définitivement."
+                    )
                 st.session_state.exclusions_save_notice = (
                     "success",
-                    f"{len(cleaned_exclusions)} exclusion(s) "
-                    "enregistrée(s) définitivement pour votre direction.",
+                    saved_message,
                 )
             except Exception:
                 st.session_state.exclusions_save_notice = (
@@ -2056,44 +2235,33 @@ elif page == "🏢 Directeur de branche":
     )
     st.session_state.use_ecb_rate = use_ecb_rate
 
-    if rate_col2.button(
+    force_rate_refresh = rate_col2.button(
         "🔄 Actualiser le taux",
         use_container_width=True,
         disabled=not use_ecb_rate,
-    ):
-        fetch_ecb_usd_to_eur_rate.clear()
-        st.rerun()
+    )
 
     active_usd_to_eur = float(st.session_state.usd_to_eur)
     rate_source = "Taux manuel de secours"
     rate_date = datetime.now().strftime("%Y-%m-%d")
 
     if use_ecb_rate:
-        try:
-            active_usd_to_eur, rate_date = fetch_ecb_usd_to_eur_rate()
-            st.session_state.last_ecb_usd_to_eur = active_usd_to_eur
-            st.session_state.last_ecb_rate_date = rate_date
-            rate_source = "Banque centrale européenne"
-            st.success(
-                f"Taux BCE du {rate_date} : "
-                f"1 $ = {active_usd_to_eur:.6f} €"
-            )
-        except Exception:
-            if st.session_state.last_ecb_usd_to_eur is not None:
-                active_usd_to_eur = float(
-                    st.session_state.last_ecb_usd_to_eur
-                )
-                rate_date = st.session_state.last_ecb_rate_date
-                rate_source = "Dernier taux BCE mémorisé"
-                st.warning(
-                    "La BCE est momentanément inaccessible. Le dernier "
-                    f"taux mémorisé du {rate_date} est utilisé."
-                )
-            else:
-                st.warning(
-                    "La BCE est momentanément inaccessible. Le taux manuel "
-                    "enregistré dans Paramètres est utilisé."
-                )
+        daily_rate_info = resolve_daily_usd_to_eur_rate(
+            database_url=(
+                database_url if persistent_settings_available else None
+            ),
+            updated_by=current_user_email,
+            force_refresh=force_rate_refresh,
+        )
+        active_usd_to_eur = float(daily_rate_info["rate"])
+        rate_date = daily_rate_info["date"]
+        rate_source = daily_rate_info["source"]
+        st.success(
+            f"Taux du {rate_date} : "
+            f"1 $ = {active_usd_to_eur:.6f} €"
+        )
+        if daily_rate_info["warning"]:
+            st.warning(daily_rate_info["warning"])
     else:
         active_usd_to_eur = st.number_input(
             "Taux manuel : valeur de 1 dollar en euros",
@@ -2285,3 +2453,285 @@ elif page == "🏢 Directeur de branche":
             f"{len(branch_consultants)} consultant(s) et "
             f"{len(branch_responsables)} responsable(s) pris en compte."
         )
+
+
+elif page == "💰 Bénéfice agence":
+    if current_user_role != "admin":
+        st.error("Cette page est réservée à l’administrateur.")
+        st.stop()
+
+    st.title("💰 Bénéfice agence")
+    show_estimation_notice()
+    st.info(
+        "Cette page calcule votre bénéfice après les charges, toutes les "
+        "rémunérations, les autres dépenses et la rémunération globale "
+        "des directeurs. Elle est visible uniquement par l’administrateur."
+    )
+
+    if st.session_state.backstage_data is None:
+        st.warning("Importez d’abord l’export Backstage complet de l’agence.")
+        st.stop()
+
+    st.subheader("Chiffre d’affaires et taux quotidien")
+    revenue_column, refresh_column = st.columns([3, 1])
+    agency_revenue_usd = revenue_column.number_input(
+        "Chiffre d’affaires total de l’agence ($)",
+        min_value=0.0,
+        value=float(st.session_state.revenue_usd),
+        step=100.0,
+        key="agency_revenue_input",
+    )
+    force_agency_rate_refresh = refresh_column.button(
+        "🔄 Actualiser le taux",
+        key="agency_refresh_daily_rate",
+        use_container_width=True,
+    )
+
+    agency_rate_info = resolve_daily_usd_to_eur_rate(
+        database_url=database_url if persistent_settings_available else None,
+        updated_by=current_user_email,
+        force_refresh=force_agency_rate_refresh,
+    )
+    st.success(
+        f"Taux du {agency_rate_info['date']} : "
+        f"1 $ = {agency_rate_info['rate']:.6f} € "
+        f"— {agency_rate_info['source']}"
+    )
+    if agency_rate_info["warning"]:
+        st.warning(agency_rate_info["warning"])
+
+    if st.button(
+        "💾 Enregistrer le chiffre d’affaires agence",
+        key="save_agency_revenue",
+        type="primary",
+        use_container_width=True,
+    ):
+        st.session_state.revenue_usd = float(agency_revenue_usd)
+
+        if persistent_settings_available:
+            try:
+                save_persistent_scopes(
+                    database_url,
+                    {
+                        branch_settings_scope(current_user_email): {
+                            key: st.session_state[key]
+                            for key in BRANCH_PARAMETER_KEYS
+                        }
+                    },
+                    current_user_email,
+                )
+                st.success(
+                    "Le chiffre d’affaires agence a été enregistré "
+                    "définitivement."
+                )
+            except Exception:
+                st.error(
+                    "Le chiffre d’affaires reste utilisable dans cette "
+                    "session, mais sa sauvegarde permanente a échoué."
+                )
+        else:
+            st.warning(
+                "Le chiffre d’affaires est conservé uniquement dans cette "
+                "session car la base permanente n’est pas configurée."
+            )
+
+    creator_signature = (
+        st.session_state.backstage_filename,
+        st.session_state.creator_level,
+    )
+    if (
+        "creator_results" not in st.session_state
+        or st.session_state.get("creator_signature") != creator_signature
+    ):
+        creator_results = calculate_creator_rewards(
+            st.session_state.backstage_data,
+            int(st.session_state.creator_level),
+        )
+        creator_results["Mode paiement"] = "Diamants"
+        st.session_state.creator_results = creator_results
+        st.session_state.creator_signature = creator_signature
+
+    agency_creators = st.session_state.creator_results.copy()
+    if "Mode paiement" not in agency_creators.columns:
+        agency_creators["Mode paiement"] = "Diamants"
+    agency_creators = financial_columns(agency_creators)
+
+    agency_consultants = calculate_consultant_rewards(
+        creator_results=agency_creators,
+        consultant_level=int(st.session_state.consultant_level),
+        minimum_team_diamonds=200_000,
+    )
+    if not agency_consultants.empty:
+        agency_consultants["Mode paiement"] = "Diamants"
+        if "consultant_results" in st.session_state:
+            saved_consultant_modes = (
+                st.session_state.consultant_results
+                .drop_duplicates("Consultant")
+                .set_index("Consultant")["Mode paiement"]
+                .to_dict()
+            )
+            agency_consultants["Mode paiement"] = agency_consultants[
+                "Consultant"
+            ].map(saved_consultant_modes).fillna("Diamants")
+
+        consultant_exclusions = excluded_emails("consultants")
+        consultant_excluded_mask = agency_consultants["Consultant"].map(
+            lambda value: normalize_email(value) in consultant_exclusions
+        )
+        agency_consultants.loc[
+            consultant_excluded_mask,
+            ["Taux", "Rémunération 💎"],
+        ] = 0
+        agency_consultants = financial_columns(agency_consultants)
+
+    agency_responsables = calculate_responsable_rewards(
+        creator_results=agency_creators,
+        responsable_level=int(st.session_state.manager_level),
+        minimum_group_diamonds=600_000,
+    )
+    if not agency_responsables.empty:
+        agency_responsables["Mode paiement"] = "Diamants"
+        if "responsable_results" in st.session_state:
+            saved_responsable_modes = (
+                st.session_state.responsable_results
+                .drop_duplicates("Responsable performance")
+                .set_index("Responsable performance")["Mode paiement"]
+                .to_dict()
+            )
+            agency_responsables["Mode paiement"] = agency_responsables[
+                "Responsable performance"
+            ].map(saved_responsable_modes).fillna("Diamants")
+
+        responsable_exclusions = excluded_emails("responsables")
+        responsable_excluded_mask = agency_responsables[
+            "Responsable performance"
+        ].map(lambda value: normalize_email(value) in responsable_exclusions)
+        agency_responsables.loc[
+            responsable_excluded_mask,
+            ["Taux", "Rémunération 💎"],
+        ] = 0
+        agency_responsables = financial_columns(agency_responsables)
+
+    creator_cost = float(agency_creators["Total déduction €"].sum())
+    consultant_cost = (
+        float(agency_consultants["Total déduction €"].sum())
+        if not agency_consultants.empty
+        else 0.0
+    )
+    responsable_cost = (
+        float(agency_responsables["Total déduction €"].sum())
+        if not agency_responsables.empty
+        else 0.0
+    )
+    agency_other_expenses = float(st.session_state.other_expenses)
+    director_rate = DIRECTOR_RATES.get(
+        int(st.session_state.director_level),
+        0.0,
+    )
+    agency_calculation = calculate_agency_profit(
+        revenue_usd=agency_revenue_usd,
+        usd_to_eur=agency_rate_info["rate"],
+        charges_rate=st.session_state.charges_rate,
+        creator_cost=creator_cost,
+        consultant_cost=consultant_cost,
+        responsable_cost=responsable_cost,
+        other_expenses=agency_other_expenses,
+        director_rate=director_rate,
+    )
+    revenue_eur = agency_calculation["revenue_eur"]
+    charges_eur = agency_calculation["charges_eur"]
+    result_before_directors = agency_calculation[
+        "result_before_directors"
+    ]
+    directors_reward = agency_calculation["directors_reward"]
+    agency_profit = agency_calculation["agency_profit"]
+
+    st.divider()
+    st.subheader("Votre résultat agence")
+    metric1, metric2, metric3, metric4, metric5 = st.columns(5)
+    metric1.metric("CA saisi", f"{agency_revenue_usd:,.2f} $")
+    metric2.metric("CA converti", f"{revenue_eur:,.2f} €")
+    metric3.metric(
+        f"Charges ({st.session_state.charges_rate:.1f} %)",
+        f"− {charges_eur:,.2f} €",
+    )
+    metric4.metric(
+        f"Directeurs ({director_rate * 100:.0f} %)",
+        f"− {directors_reward:,.2f} €",
+    )
+    metric5.metric("Votre bénéfice", f"{agency_profit:,.2f} €")
+
+    if agency_profit < 0:
+        st.error(
+            "Le résultat calculé est négatif : les charges et dépenses "
+            "dépassent le chiffre d’affaires converti."
+        )
+    else:
+        st.success(
+            f"Bénéfice agence estimé pour {st.session_state.month} : "
+            f"{agency_profit:,.2f} €"
+        )
+
+    st.caption(
+        "La rémunération globale des directeurs correspond au palier "
+        "Directeur appliqué au résultat positif avant directeurs. Le taux "
+        "BCE ne modifie jamais la valeur facture par diamant."
+    )
+
+    agency_summary = pd.DataFrame(
+        [
+            ("Chiffre d’affaires converti", revenue_eur),
+            ("Charges sur le CA", -charges_eur),
+            ("Rémunérations créateurs", -creator_cost),
+            ("Rémunérations consultants", -consultant_cost),
+            (
+                "Rémunérations responsables performance",
+                -responsable_cost,
+            ),
+            ("Autres dépenses agence", -agency_other_expenses),
+            ("Résultat avant directeurs", result_before_directors),
+            ("Rémunérations globales des directeurs", -directors_reward),
+            ("Votre bénéfice agence", agency_profit),
+        ],
+        columns=["Élément", "Montant €"],
+    )
+    st.dataframe(
+        agency_summary,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Montant €": st.column_config.NumberColumn(format="%.2f €")
+        },
+    )
+    show_excel_download(
+        agency_summary,
+        table_name="benefice_agence",
+        sheet_name="Bénéfice agence",
+        key="download_agency_profit_summary",
+    )
+
+    agency_parameters = pd.DataFrame(
+        [
+            ("Mois", st.session_state.month),
+            ("Chiffre d’affaires saisi ($)", agency_revenue_usd),
+            ("Taux USD vers EUR", agency_rate_info["rate"]),
+            ("Date du taux BCE", agency_rate_info["date"]),
+            ("Source du taux", agency_rate_info["source"]),
+            ("Palier Directeur (%)", director_rate * 100),
+            ("Charges (%)", st.session_state.charges_rate),
+            ("Valeur facture par diamant (€)", st.session_state.invoice_rate),
+        ],
+        columns=["Paramètre", "Valeur"],
+    )
+    show_workbook_download(
+        [
+            ("Bénéfice agence", agency_summary),
+            ("Paramètres", agency_parameters),
+            ("Créateurs", agency_creators),
+            ("Consultants", agency_consultants),
+            ("Responsables", agency_responsables),
+        ],
+        table_name="calcul_complet_benefice_agence",
+        key="download_complete_agency_workbook",
+        label="📦 Télécharger le calcul complet de l’agence (Excel)",
+    )
