@@ -1,10 +1,13 @@
 import json
+import re
+import unicodedata
 
 import pandas as pd
 import psycopg
 import streamlit as st
 from datetime import datetime
 from html import escape
+from io import BytesIO
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
@@ -375,6 +378,131 @@ def render_brand_hero(title, subtitle, kicker="PRO CONSULTING"):
         </section>
         """,
         unsafe_allow_html=True,
+    )
+
+
+def safe_export_name(value):
+    """Construit un fragment de nom de fichier lisible et portable."""
+    ascii_value = unicodedata.normalize("NFKD", str(value or ""))
+    ascii_value = ascii_value.encode("ascii", "ignore").decode("ascii")
+    cleaned_value = re.sub(r"[^a-zA-Z0-9]+", "_", ascii_value)
+    return cleaned_value.strip("_").lower() or "export"
+
+
+def safe_sheet_name(value):
+    """Respecte les contraintes de nommage des feuilles Excel."""
+    cleaned_value = re.sub(r"[\\/*?:\[\]]", "-", str(value or "Données"))
+    return cleaned_value[:31] or "Données"
+
+
+def prepare_excel_dataframe(dataframe):
+    """Prépare une copie exportable sans modifier le tableau affiché."""
+    export_dataframe = dataframe.copy().reset_index(drop=True)
+
+    for column in export_dataframe.select_dtypes(include=["datetimetz"]):
+        export_dataframe[column] = export_dataframe[column].dt.tz_localize(
+            None
+        )
+
+    return export_dataframe
+
+
+def write_excel_sheet(writer, dataframe, sheet_name):
+    """Ajoute une feuille lisible avec en-tête figé et filtres actifs."""
+    export_dataframe = prepare_excel_dataframe(dataframe)
+    safe_name = safe_sheet_name(sheet_name)
+    export_dataframe.to_excel(writer, index=False, sheet_name=safe_name)
+
+    worksheet = writer.sheets[safe_name]
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = worksheet.dimensions
+
+    for column_index, column_name in enumerate(
+        export_dataframe.columns,
+        start=1,
+    ):
+        displayed_values = export_dataframe[column_name].head(500).tolist()
+        maximum_length = max(
+            [len(str(column_name))]
+            + [len(str(value)) for value in displayed_values]
+        )
+        worksheet.column_dimensions[
+            worksheet.cell(row=1, column=column_index).column_letter
+        ].width = min(maximum_length + 2, 45)
+
+
+@st.cache_data(show_spinner=False)
+def dataframe_to_excel(dataframe, sheet_name):
+    """Transforme un tableau en classeur Excel téléchargeable."""
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        write_excel_sheet(writer, dataframe, sheet_name)
+    return output.getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def dataframes_to_excel(workbook_tables):
+    """Crée un classeur Excel regroupant plusieurs tableaux."""
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for sheet_name, dataframe in workbook_tables:
+            write_excel_sheet(writer, dataframe, sheet_name)
+    return output.getvalue()
+
+
+def export_filename(table_name):
+    """Ajoute automatiquement la direction et le mois au nom du fichier."""
+    direction = globals().get("current_user_direction", "direction")
+    month = st.session_state.get("month", "mois")
+    return "_".join(
+        [
+            "pro_consulting",
+            safe_export_name(direction),
+            safe_export_name(month),
+            safe_export_name(table_name),
+        ]
+    ) + ".xlsx"
+
+
+def show_excel_download(
+    dataframe,
+    table_name,
+    sheet_name,
+    key,
+    label="⬇️ Télécharger ce tableau (Excel)",
+):
+    """Affiche un bouton d'export Excel pour tout administrateur/directeur."""
+    st.download_button(
+        label=label,
+        data=dataframe_to_excel(dataframe, sheet_name),
+        file_name=export_filename(table_name),
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        key=key,
+        use_container_width=True,
+    )
+
+
+def show_workbook_download(
+    workbook_tables,
+    table_name,
+    key,
+    label="⬇️ Télécharger le classeur complet (Excel)",
+):
+    """Affiche un bouton d'export regroupant plusieurs feuilles Excel."""
+    st.download_button(
+        label=label,
+        data=dataframes_to_excel(tuple(workbook_tables)),
+        file_name=export_filename(table_name),
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        key=key,
+        use_container_width=True,
+        type="primary",
     )
 
 
@@ -1049,6 +1177,13 @@ elif page == "📥 Import Backstage":
                 use_container_width=True,
                 hide_index=True,
             )
+            show_excel_download(
+                prepared_dataframe,
+                table_name="donnees_backstage_preparees",
+                sheet_name="Backstage préparé",
+                key="download_backstage_prepared",
+                label="⬇️ Télécharger toutes les données préparées (Excel)",
+            )
 
         except ValueError as error:
             st.error("Certaines colonnes obligatoires sont absentes.")
@@ -1303,15 +1438,22 @@ elif page == "🛡️ Administration":
 
         if detected_rows:
             detected_dataframe = pd.DataFrame(detected_rows).drop_duplicates()
+            detected_dataframe = detected_dataframe.sort_values(
+                ["Emplacement", "Adresse détectée"]
+            )
             with st.expander(
                 "🔎 Voir toutes les adresses détectées dans l’export"
             ):
                 st.dataframe(
-                    detected_dataframe.sort_values(
-                        ["Emplacement", "Adresse détectée"]
-                    ),
+                    detected_dataframe,
                     use_container_width=True,
                     hide_index=True,
+                )
+                show_excel_download(
+                    detected_dataframe,
+                    table_name="adresses_detectees",
+                    sheet_name="Adresses détectées",
+                    key="download_detected_addresses",
                 )
 
     exclusions_dataframe = pd.DataFrame(
@@ -1348,6 +1490,12 @@ elif page == "🛡️ Administration":
             ),
         },
         key="exclusions_editor",
+    )
+    show_excel_download(
+        edited_exclusions,
+        table_name="exclusions",
+        sheet_name="Exclusions",
+        key="download_exclusions",
     )
 
     if st.button(
@@ -1488,6 +1636,12 @@ elif page == "💎 Créateurs":
         },
         key="creator_payment_editor",
     )
+    show_excel_download(
+        edited_payment_table,
+        table_name="paiements_createurs",
+        sheet_name="Paiements créateurs",
+        key="download_creator_payments",
+    )
 
     creator_results["Mode paiement"] = edited_payment_table[
         "Mode paiement"
@@ -1530,6 +1684,12 @@ elif page == "💎 Créateurs":
             creator_results,
             use_container_width=True,
             hide_index=True,
+        )
+        show_excel_download(
+            creator_results,
+            table_name="detail_createurs",
+            sheet_name="Détail créateurs",
+            key="download_creator_details",
         )
 
 
@@ -1636,6 +1796,12 @@ elif page == "👥 Consultants":
         },
         key="consultant_payment_editor",
     )
+    show_excel_download(
+        edited_payment_table,
+        table_name="paiements_consultants",
+        sheet_name="Paiements consultants",
+        key="download_consultant_payments",
+    )
 
     consultant_results["Mode paiement"] = edited_payment_table[
         "Mode paiement"
@@ -1669,6 +1835,12 @@ elif page == "👥 Consultants":
             consultant_results,
             use_container_width=True,
             hide_index=True,
+        )
+        show_excel_download(
+            consultant_results,
+            table_name="detail_consultants",
+            sheet_name="Détail consultants",
+            key="download_consultant_details",
         )
 
 
@@ -1776,6 +1948,12 @@ elif page == "📈 Responsables performance":
         },
         key="responsable_payment_editor",
     )
+    show_excel_download(
+        edited_payment_table,
+        table_name="paiements_responsables",
+        sheet_name="Paiements responsables",
+        key="download_responsable_payments",
+    )
 
     responsable_results["Mode paiement"] = edited_payment_table[
         "Mode paiement"
@@ -1809,6 +1987,12 @@ elif page == "📈 Responsables performance":
             responsable_results,
             use_container_width=True,
             hide_index=True,
+        )
+        show_excel_download(
+            responsable_results,
+            table_name="detail_responsables",
+            sheet_name="Détail responsables",
+            key="download_responsable_details",
         )
 
 
@@ -2074,6 +2258,24 @@ elif page == "🏢 Directeur de branche":
         column_config={
             "Montant €": st.column_config.NumberColumn(format="%.2f €")
         },
+    )
+    show_excel_download(
+        summary,
+        table_name="synthese_directeur",
+        sheet_name="Synthèse directeur",
+        key="download_director_summary",
+    )
+
+    show_workbook_download(
+        [
+            ("Synthèse", summary),
+            ("Créateurs", branch_creators),
+            ("Consultants", branch_consultants),
+            ("Responsables", branch_responsables),
+        ],
+        table_name="resultats_complets_branche",
+        key="download_complete_branch_workbook",
+        label="📦 Télécharger tous les résultats de la branche (Excel)",
     )
 
     with st.expander("Voir les groupes sélectionnés"):
