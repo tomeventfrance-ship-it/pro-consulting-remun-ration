@@ -1,4 +1,5 @@
 import json
+import hashlib
 import re
 import unicodedata
 
@@ -7,7 +8,7 @@ import psycopg
 import streamlit as st
 from datetime import datetime
 from html import escape
-from io import BytesIO
+from io import BytesIO, StringIO
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 from urllib.request import Request, urlopen
@@ -725,6 +726,21 @@ def save_persistent_scopes(database_url, scopes, updated_by):
         connection.commit()
 
 
+def delete_persistent_scopes(database_url, scopes):
+    """Supprime uniquement les blocs persistants explicitement demandés."""
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            for scope in scopes:
+                cursor.execute(
+                    """
+                    DELETE FROM pro_consulting_settings
+                    WHERE scope = %s
+                    """,
+                    (scope,),
+                )
+        connection.commit()
+
+
 def branch_settings_scope(user_email):
     """Chaque direction conserve ses propres paramètres mensuels."""
     return f"branch:{normalize_email(user_email)}"
@@ -733,6 +749,11 @@ def branch_settings_scope(user_email):
 def exclusions_scope(user_email):
     """Chaque direction conserve sa propre liste d'exclusions."""
     return f"exclusions:{normalize_email(user_email)}"
+
+
+def backstage_import_scope(user_email):
+    """Chaque compte conserve uniquement son dernier import validé."""
+    return f"backstage:{normalize_email(user_email)}"
 
 
 def director_management_scope():
@@ -749,6 +770,73 @@ def reward_tracking_scope(month):
             safe_export_name(month),
         ]
     )
+
+
+PERSISTED_BACKSTAGE_COLUMNS = [
+    "Pseudo",
+    "Groupe",
+    "Agent",
+    "Diamants",
+    "Heures LIVE",
+    "Jours valides",
+    "Statut évolution",
+    "Statut échelon",
+]
+
+
+def serialize_backstage_dataframe(dataframe):
+    """Sérialise le tableau préparé dans un format typé et portable."""
+    return dataframe[PERSISTED_BACKSTAGE_COLUMNS].to_json(
+        orient="table",
+        index=False,
+        date_format="iso",
+        force_ascii=False,
+    )
+
+
+def deserialize_backstage_dataframe(serialized_dataframe):
+    """Restaure et revalide les types du dernier import Backstage."""
+    if not isinstance(serialized_dataframe, str) or not serialized_dataframe:
+        raise ValueError("Le fichier Backstage enregistré est vide.")
+
+    dataframe = pd.read_json(
+        StringIO(serialized_dataframe),
+        orient="table",
+    )
+    missing_columns = [
+        column
+        for column in PERSISTED_BACKSTAGE_COLUMNS
+        if column not in dataframe.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            "Colonnes absentes de l'import enregistré : "
+            + ", ".join(missing_columns)
+        )
+
+    dataframe = dataframe[PERSISTED_BACKSTAGE_COLUMNS].copy()
+    for column in (
+        "Pseudo",
+        "Groupe",
+        "Agent",
+        "Statut évolution",
+        "Statut échelon",
+    ):
+        dataframe[column] = dataframe[column].fillna("").astype(str).str.strip()
+
+    dataframe["Diamants"] = pd.to_numeric(
+        dataframe["Diamants"],
+        errors="coerce",
+    ).fillna(0).round(0).astype(int)
+    dataframe["Heures LIVE"] = pd.to_numeric(
+        dataframe["Heures LIVE"],
+        errors="coerce",
+    ).fillna(0.0).round(2)
+    dataframe["Jours valides"] = pd.to_numeric(
+        dataframe["Jours valides"],
+        errors="coerce",
+    ).fillna(0).round(0).astype(int)
+    return dataframe.reset_index(drop=True)
 
 
 def apply_persistent_settings(database_url, user_email):
@@ -1116,6 +1204,16 @@ def reset_calculations():
         "reward_tracking_save_notice",
     ):
         st.session_state.pop(key, None)
+
+
+def clear_backstage_session():
+    """Retire l'import du compte courant sans toucher aux autres comptes."""
+    st.session_state.backstage_data = None
+    st.session_state.backstage_filename = None
+    st.session_state.pop("backstage_raw_data", None)
+    st.session_state.pop("backstage_file_digest", None)
+    st.session_state.pop("detected_columns", None)
+    reset_calculations()
 
 
 def financial_columns(dataframe):
@@ -1800,15 +1898,14 @@ if st.session_state.get("active_user_email") != current_user_email:
     for key in BRANCH_PARAMETER_KEYS:
         st.session_state[key] = DEFAULT_VALUES[key]
     st.session_state.exclusions = []
-    st.session_state.backstage_data = None
-    st.session_state.backstage_filename = None
-    st.session_state.pop("backstage_raw_data", None)
-    st.session_state.pop("detected_columns", None)
+    clear_backstage_session()
     st.session_state.pop("exclusions_editor", None)
     st.session_state.pop("persistent_settings_loaded_for", None)
+    st.session_state.pop("persistent_backstage_loaded_for", None)
+    st.session_state.pop("backstage_restore_notice", None)
+    st.session_state.pop("backstage_restore_error", None)
     st.session_state.pop("admin_director_management_loaded", None)
     st.session_state.pop("admin_director_management_config", None)
-    reset_calculations()
     st.session_state.active_user_email = current_user_email
 
 database_url = get_database_url()
@@ -1837,6 +1934,65 @@ if persistent_settings_available:
             "Les valeurs de cette session restent utilisables, mais elles "
             "ne seront pas sauvegardées après la déconnexion."
         )
+
+if persistent_settings_available:
+    backstage_session_key = backstage_import_scope(current_user_email)
+    if (
+        st.session_state.get("persistent_backstage_loaded_for")
+        != backstage_session_key
+    ):
+        try:
+            saved_backstage = load_persistent_scope(
+                database_url,
+                backstage_session_key,
+            )
+            serialized_backstage = saved_backstage.get(
+                "prepared_dataframe_json"
+            )
+            if serialized_backstage:
+                restored_backstage = deserialize_backstage_dataframe(
+                    serialized_backstage
+                )
+                if current_user_role == "director":
+                    restored_import_control = validate_director_import_groups(
+                        prepared_dataframe=restored_backstage,
+                        user_email=current_user_email,
+                        database_url=database_url,
+                    )
+                    if not restored_import_control["valid"]:
+                        raise ValueError(restored_import_control["error"])
+
+                clear_backstage_session()
+                st.session_state.backstage_data = restored_backstage
+                st.session_state.backstage_filename = str(
+                    saved_backstage.get("filename", "Export enregistré")
+                )
+                st.session_state.detected_columns = saved_backstage.get(
+                    "detected_columns",
+                    {},
+                )
+                st.session_state.backstage_file_digest = str(
+                    saved_backstage.get("file_digest", "")
+                ) or hashlib.sha256(
+                    serialized_backstage.encode("utf-8")
+                ).hexdigest()
+                st.session_state.backstage_restore_notice = (
+                    "Le dernier export Backstage enregistré a été restauré "
+                    "automatiquement."
+                )
+
+            st.session_state.persistent_backstage_loaded_for = (
+                backstage_session_key
+            )
+        except Exception as error:
+            clear_backstage_session()
+            st.session_state.backstage_restore_error = (
+                "Le dernier export enregistré n'a pas pu être restauré : "
+                f"{error}"
+            )
+            st.session_state.persistent_backstage_loaded_for = (
+                backstage_session_key
+            )
 
 
 st.sidebar.markdown(
@@ -1938,21 +2094,88 @@ if page == "🏠 Accueil":
 elif page == "📥 Import Backstage":
     st.title("📥 Import Backstage")
 
+    restore_notice = st.session_state.pop("backstage_restore_notice", None)
+    if restore_notice:
+        st.success(restore_notice)
+    restore_error = st.session_state.pop("backstage_restore_error", None)
+    if restore_error:
+        st.warning(restore_error)
+
     if st.session_state.backstage_data is not None:
         st.success(
             f"Fichier actuellement chargé : "
             f"{st.session_state.backstage_filename}"
         )
+        if persistent_settings_available:
+            st.caption(
+                "☁️ Cet export est enregistré pour votre compte et sera "
+                "restauré automatiquement après votre prochaine connexion."
+            )
+
+        delete_generation = int(
+            st.session_state.get("backstage_delete_generation", 0)
+        )
+        with st.expander("🗑️ Supprimer l’export actuellement enregistré"):
+            st.warning(
+                "Cette action supprime uniquement l’export de votre compte. "
+                "Elle ne touche jamais aux fichiers des autres directions."
+            )
+            confirm_backstage_deletion = st.checkbox(
+                "Je confirme la suppression de cet export Backstage.",
+                key=f"confirm_backstage_deletion_{delete_generation}",
+            )
+            if st.button(
+                "Supprimer définitivement cet export",
+                key=f"delete_backstage_import_{delete_generation}",
+                disabled=not confirm_backstage_deletion,
+                use_container_width=True,
+            ):
+                try:
+                    if persistent_settings_available:
+                        delete_persistent_scopes(
+                            database_url,
+                            [backstage_import_scope(current_user_email)],
+                        )
+                    clear_backstage_session()
+                    st.session_state.backstage_delete_generation = (
+                        delete_generation + 1
+                    )
+                    st.session_state.backstage_uploader_generation = int(
+                        st.session_state.get(
+                            "backstage_uploader_generation",
+                            0,
+                        )
+                    ) + 1
+                    st.success("L’export Backstage a été supprimé.")
+                    st.rerun()
+                except Exception:
+                    st.error(
+                        "La suppression permanente a échoué. L’export "
+                        "actuellement enregistré a été conservé."
+                    )
+
+    uploader_generation = int(
+        st.session_state.get("backstage_uploader_generation", 0)
+    )
 
     uploaded_file = st.file_uploader(
-        "Choisir l’export Backstage",
+        "Choisir un nouvel export Backstage",
         type=["xlsx"],
-        help="Le fichier doit être au format Excel .xlsx",
+        help=(
+            "Après validation, ce fichier remplacera automatiquement "
+            "l’ancien export enregistré pour votre compte."
+        ),
+        key=f"backstage_file_uploader_{uploader_generation}",
     )
 
     if uploaded_file is not None:
         try:
-            raw_dataframe = pd.read_excel(uploaded_file, sheet_name=0)
+            uploaded_bytes = uploaded_file.getvalue()
+            uploaded_digest = hashlib.sha256(uploaded_bytes).hexdigest()
+            raw_dataframe = pd.read_excel(
+                BytesIO(uploaded_bytes),
+                sheet_name=0,
+            )
             prepared_dataframe, detected_columns = prepare_backstage_data(
                 raw_dataframe
             )
@@ -1966,11 +2189,6 @@ elif page == "📥 Import Backstage":
                     ),
                 )
                 if not import_control["valid"]:
-                    st.session_state.backstage_data = None
-                    st.session_state.backstage_filename = None
-                    st.session_state.pop("backstage_raw_data", None)
-                    st.session_state.pop("detected_columns", None)
-                    reset_calculations()
                     st.error(f"⛔ {import_control['error']}")
                     if import_control["missing_groups"]:
                         st.warning(
@@ -1991,20 +2209,67 @@ elif page == "📥 Import Backstage":
                         )
                     st.info(
                         "Aucune donnée de ce fichier n’a été chargée. "
-                        "Corrigez l’export Backstage puis recommencez."
+                        "Le dernier export valide reste enregistré. Corrigez "
+                        "le nouveau fichier puis recommencez."
                     )
                     st.stop()
 
             is_new_file = (
-                uploaded_file.name != st.session_state.backstage_filename
+                uploaded_digest
+                != st.session_state.get("backstage_file_digest")
             )
             st.session_state.backstage_data = prepared_dataframe
             st.session_state.backstage_raw_data = raw_dataframe
             st.session_state.backstage_filename = uploaded_file.name
+            st.session_state.backstage_file_digest = uploaded_digest
             st.session_state.detected_columns = detected_columns
 
             if is_new_file:
                 reset_calculations()
+                if persistent_settings_available:
+                    try:
+                        save_persistent_scopes(
+                            database_url,
+                            {
+                                backstage_import_scope(
+                                    current_user_email
+                                ): {
+                                    "filename": uploaded_file.name,
+                                    "file_digest": uploaded_digest,
+                                    "month": st.session_state.month,
+                                    "detected_columns": detected_columns,
+                                    "prepared_dataframe_json": (
+                                        serialize_backstage_dataframe(
+                                            prepared_dataframe
+                                        )
+                                    ),
+                                    "saved_at": datetime.now().isoformat(
+                                        timespec="seconds"
+                                    ),
+                                }
+                            },
+                            current_user_email,
+                        )
+                        st.session_state.persistent_backstage_loaded_for = (
+                            backstage_import_scope(current_user_email)
+                        )
+                        st.success(
+                            "☁️ Le nouvel export remplace l’ancien et est "
+                            "enregistré définitivement pour votre compte."
+                        )
+                    except Exception:
+                        st.error(
+                            "Le fichier est utilisable dans cette session, "
+                            "mais sa sauvegarde permanente a échoué. "
+                            "L’ancien export enregistré n’a pas été supprimé."
+                        )
+                elif persistent_settings_error:
+                    st.error(persistent_settings_error)
+                else:
+                    st.warning(
+                        "La base PostgreSQL n’est pas configurée : ce fichier "
+                        "restera uniquement dans cette session."
+                    )
 
             if current_user_role == "director":
                 st.success(
@@ -2919,6 +3184,12 @@ elif page == "🎁 Suivi récompenses":
         "les champs de suivi restent modifiables par l’équipe. Un créateur "
         "payé en Facture € apparaît automatiquement à 0 💎 dans ce suivi."
     )
+    tracking_reset_notice = st.session_state.pop(
+        "reward_tracking_reset_notice",
+        None,
+    )
+    if tracking_reset_notice:
+        st.success(tracking_reset_notice)
 
     refresh_tracking = st.button(
         "🔄 Actualiser les données partagées",
@@ -3158,6 +3429,67 @@ elif page == "🎁 Suivi récompenses":
         "la colonne Total récompense contient une formule automatique. Le "
         "fichier .xlsx peut être importé directement dans Google Sheets."
     )
+
+    tracking_delete_generation = int(
+        st.session_state.get("reward_tracking_delete_generation", 0)
+    )
+    tracking_month_key = safe_export_name(st.session_state.month)
+    with st.expander(
+        f"🗑️ Réinitialiser le suivi collectif — {st.session_state.month}"
+    ):
+        st.warning(
+            "Cette suppression est collective : les informations manuelles "
+            "de ce mois seront effacées pour l’administration et les quatre "
+            "directions. Les récompenses automatiques seront recalculées à "
+            "partir du fichier Backstage actuellement chargé."
+        )
+        confirm_tracking_deletion = st.checkbox(
+            "Je confirme la réinitialisation du suivi collectif de ce mois.",
+            key=(
+                "confirm_reward_tracking_deletion_"
+                f"{tracking_month_key}_{tracking_delete_generation}"
+            ),
+        )
+        if st.button(
+            "Réinitialiser définitivement ce mois",
+            key=(
+                "delete_reward_tracking_"
+                f"{tracking_month_key}_{tracking_delete_generation}"
+            ),
+            disabled=not confirm_tracking_deletion,
+            use_container_width=True,
+        ):
+            if persistent_settings_available:
+                try:
+                    delete_persistent_scopes(
+                        database_url,
+                        [tracking_scope],
+                    )
+                    st.session_state.pop(
+                        "reward_tracking_loaded_scope",
+                        None,
+                    )
+                    st.session_state.pop("reward_tracking_editor", None)
+                    st.session_state.pop("reward_tracking_table", None)
+                    st.session_state.reward_tracking_delete_generation = (
+                        tracking_delete_generation + 1
+                    )
+                    st.session_state.reward_tracking_reset_notice = (
+                        "Le suivi collectif du mois a été réinitialisé."
+                    )
+                    st.rerun()
+                except Exception:
+                    st.error(
+                        "La réinitialisation a échoué. Les informations "
+                        "enregistrées ont été conservées."
+                    )
+            elif persistent_settings_error:
+                st.error(persistent_settings_error)
+            else:
+                st.error(
+                    "La base PostgreSQL n’est pas configurée : aucune "
+                    "suppression collective permanente n’est possible."
+                )
 
 
 elif page == "🏢 Directeur de branche":
