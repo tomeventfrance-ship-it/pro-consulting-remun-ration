@@ -2130,29 +2130,35 @@ elif page == "📥 Import Backstage":
                 disabled=not confirm_backstage_deletion,
                 use_container_width=True,
             ):
-                try:
-                    if persistent_settings_available:
-                        delete_persistent_scopes(
-                            database_url,
-                            [backstage_import_scope(current_user_email)],
-                        )
-                    clear_backstage_session()
-                    st.session_state.backstage_delete_generation = (
-                        delete_generation + 1
-                    )
-                    st.session_state.backstage_uploader_generation = int(
-                        st.session_state.get(
-                            "backstage_uploader_generation",
-                            0,
-                        )
-                    ) + 1
-                    st.success("L’export Backstage a été supprimé.")
-                    st.rerun()
-                except Exception:
+                if persistent_settings_error:
                     st.error(
-                        "La suppression permanente a échoué. L’export "
-                        "actuellement enregistré a été conservé."
+                        "La base permanente est momentanément inaccessible. "
+                        "La suppression est bloquée afin de conserver une "
+                        "situation cohérente."
                     )
+                else:
+                    try:
+                        if persistent_settings_available:
+                            delete_persistent_scopes(
+                                database_url,
+                                [backstage_import_scope(current_user_email)],
+                            )
+                        clear_backstage_session()
+                        st.session_state.backstage_delete_generation = (
+                            delete_generation + 1
+                        )
+                        st.session_state.backstage_uploader_generation = int(
+                            st.session_state.get(
+                                "backstage_uploader_generation",
+                                0,
+                            )
+                        ) + 1
+                        st.rerun()
+                    except Exception:
+                        st.error(
+                            "La suppression permanente a échoué. L’export "
+                            "actuellement enregistré a été conservé."
+                        )
 
     uploader_generation = int(
         st.session_state.get("backstage_uploader_generation", 0)
