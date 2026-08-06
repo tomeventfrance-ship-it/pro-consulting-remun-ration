@@ -1894,6 +1894,22 @@ page = st.sidebar.radio(
     admin_pages if current_user_role == "admin" else director_pages,
 )
 
+# Le suivi est partagé entre plusieurs sessions Streamlit. Lorsqu'un
+# utilisateur revient sur cette page, on recharge systématiquement la copie
+# PostgreSQL afin qu'il voie les enregistrements effectués entre-temps par une
+# autre direction. Les reruns provoqués par l'éditeur ne déclenchent pas ce
+# rechargement et conservent donc les modifications locales non enregistrées.
+previous_navigation_page = st.session_state.get(
+    "previous_navigation_page"
+)
+if (
+    page == "🎁 Suivi récompenses"
+    and previous_navigation_page != page
+):
+    st.session_state.pop("reward_tracking_loaded_scope", None)
+    st.session_state.pop("reward_tracking_editor", None)
+st.session_state.previous_navigation_page = page
+
 
 if page == "🏠 Accueil":
     render_brand_hero(
@@ -2903,6 +2919,28 @@ elif page == "🎁 Suivi récompenses":
         "les champs de suivi restent modifiables par l’équipe. Un créateur "
         "payé en Facture € apparaît automatiquement à 0 💎 dans ce suivi."
     )
+
+    refresh_tracking = st.button(
+        "🔄 Actualiser les données partagées",
+        key="refresh_collective_reward_tracking",
+        use_container_width=True,
+        help=(
+            "Recharge immédiatement la dernière sauvegarde effectuée par "
+            "l'administration ou l'une des quatre directions."
+        ),
+    )
+    if refresh_tracking:
+        st.session_state.pop("reward_tracking_loaded_scope", None)
+        st.session_state.pop("reward_tracking_editor", None)
+        st.session_state.pop("reward_tracking_table", None)
+
+    if not persistent_settings_available:
+        st.warning(
+            "Le partage entre les comptes est indisponible tant que la "
+            "base PostgreSQL n'est pas connectée dans les Secrets "
+            "Streamlit. Chaque navigateur voit alors uniquement sa propre "
+            "session."
+        )
 
     creator_results_for_tracking = pd.DataFrame(
         columns=["Pseudo", "Rémunération 💎"]
