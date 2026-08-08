@@ -471,6 +471,7 @@ def reward_tracking_to_excel(dataframe):
 
         header_fill = PatternFill("solid", fgColor="007C86")
         total_fill = PatternFill("solid", fgColor="FFC857")
+        sent_fill = PatternFill("solid", fgColor="B7F7D0")
         for cell in worksheet[1]:
             cell.fill = header_fill
             cell.font = Font(color="FFFFFF", bold=True)
@@ -483,7 +484,7 @@ def reward_tracking_to_excel(dataframe):
 
         data_last_row = len(export_dataframe) + 1
         if len(export_dataframe):
-            worksheet.auto_filter.ref = f"A1:G{data_last_row}"
+            worksheet.auto_filter.ref = f"A1:H{data_last_row}"
             event_validation = DataValidation(
                 type="list",
                 formula1='"Live,Match"',
@@ -502,6 +503,15 @@ def reward_tracking_to_excel(dataframe):
                     worksheet[f"{column_letter}{row_number}"].number_format = (
                         "#,##0"
                     )
+                if bool(
+                    export_dataframe.iloc[row_number - 2].get(
+                        "Récompense envoyée",
+                        False,
+                    )
+                ):
+                    for cell in worksheet[row_number]:
+                        cell.fill = sent_fill
+                        cell.font = Font(color="073B24", bold=True)
 
             total_row = data_last_row + 1
             worksheet[f"D{total_row}"] = "TOTAL GÉNÉRAL"
@@ -524,6 +534,7 @@ def reward_tracking_to_excel(dataframe):
             "E": 25,
             "F": 38,
             "G": 23,
+            "H": 24,
         }
         for column_letter, width in column_widths.items():
             worksheet.column_dimensions[column_letter].width = width
@@ -1025,6 +1036,7 @@ REWARD_TRACKING_COLUMNS = [
     "Récompense créateur",
     "Rémunération consultant / responsable",
     "Total récompense",
+    "Récompense envoyée",
 ]
 
 
@@ -1042,6 +1054,16 @@ def clean_reward_tracking_rows(rows):
             return max(0, int(round(float(value or 0))))
         except (TypeError, ValueError):
             return 0
+
+    def clean_checkbox(value):
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().casefold() in {
+            "true",
+            "1",
+            "oui",
+            "yes",
+        }
 
     for row in rows:
         if not isinstance(row, dict):
@@ -1070,6 +1092,9 @@ def clean_reward_tracking_rows(rows):
                 "Récompense créateur": creator_reward,
                 "Rémunération consultant / responsable": hierarchy_reward,
                 "Total récompense": creator_reward + hierarchy_reward,
+                "Récompense envoyée": clean_checkbox(
+                    row.get("Récompense envoyée", False)
+                ),
             }
         )
 
@@ -1134,6 +1159,9 @@ def build_reward_tracking_table(creator_results, saved_rows=None):
                 "Récompense créateur": creator_reward,
                 "Rémunération consultant / responsable": hierarchy_reward,
                 "Total récompense": creator_reward + hierarchy_reward,
+                "Récompense envoyée": bool(
+                    saved_row.get("Récompense envoyée", False)
+                ),
             }
         )
 
@@ -1155,6 +1183,7 @@ def merge_collective_reward_tracking_rows(
     local_rows,
     baseline_rows,
     local_creators,
+    can_update_sent_status=False,
 ):
     """Fusionne une sauvegarde sans effacer le travail d'un autre compte."""
     remote_rows = clean_reward_tracking_rows(remote_rows)
@@ -1187,6 +1216,8 @@ def merge_collective_reward_tracking_rows(
         "Type d’événement",
         "Rémunération consultant / responsable",
     )
+    if can_update_sent_status:
+        manual_columns += ("Récompense envoyée",)
     merged_rows = []
 
     for creator_key in ordered_keys:
@@ -1226,6 +1257,16 @@ def merge_collective_reward_tracking_rows(
     return clean_reward_tracking_rows(merged_rows)
 
 
+def style_sent_reward_rows(row):
+    """Met visuellement en vert les récompenses confirmées comme envoyées."""
+    if bool(row.get("Récompense envoyée", False)):
+        return [
+            "background-color: #b7f7d0; color: #073b24; font-weight: 700"
+            for _ in row
+        ]
+    return ["" for _ in row]
+
+
 def synchronize_reward_tracking_editor():
     """Recalcule le total dès qu’une cellule manuelle est modifiée."""
     current_table = st.session_state.get("reward_tracking_table")
@@ -1242,6 +1283,8 @@ def synchronize_reward_tracking_editor():
         "Type d’événement",
         "Rémunération consultant / responsable",
     }
+    if globals().get("current_user_role") == "admin":
+        editable_columns.add("Récompense envoyée")
     for row_index, changes in editor_state.get("edited_rows", {}).items():
         try:
             row_number = int(row_index)
@@ -3455,16 +3498,24 @@ elif page == "🎁 Suivi récompenses":
         )
         st.stop()
 
+    disabled_tracking_columns = [
+        "Créateur",
+        "Récompense créateur",
+        "Total récompense",
+    ]
+    if current_user_role != "admin":
+        disabled_tracking_columns.append("Récompense envoyée")
+
+    styled_tracking_table = tracking_table.style.apply(
+        style_sent_reward_rows,
+        axis=1,
+    )
     edited_tracking_table = st.data_editor(
-        tracking_table,
+        styled_tracking_table,
         use_container_width=True,
         hide_index=True,
         num_rows="fixed",
-        disabled=[
-            "Créateur",
-            "Récompense créateur",
-            "Total récompense",
-        ],
+        disabled=disabled_tracking_columns,
         column_config={
             "Date": st.column_config.TextColumn(
                 "Date",
@@ -3501,6 +3552,14 @@ elif page == "🎁 Suivi récompenses":
                 step=100,
                 format="%d 💎",
                 help="Calcul automatique et non modifiable.",
+            ),
+            "Récompense envoyée": st.column_config.CheckboxColumn(
+                "Récompense envoyée",
+                help=(
+                    "Seul l’administrateur peut confirmer ou annuler "
+                    "l’envoi de la récompense."
+                ),
+                default=False,
             ),
         },
         key="reward_tracking_editor",
@@ -3570,6 +3629,9 @@ elif page == "🎁 Suivi récompenses":
                             [],
                         ),
                         local_creators=local_creator_names,
+                        can_update_sent_status=(
+                            current_user_role == "admin"
+                        ),
                     )
                 )
                 saved_at = datetime.now().isoformat(timespec="seconds")
