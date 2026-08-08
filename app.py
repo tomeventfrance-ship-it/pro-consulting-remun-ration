@@ -761,8 +761,13 @@ def director_management_scope():
     return "admin:director_management"
 
 
-def reward_tracking_scope(month):
-    """Le suivi mensuel est collectif pour toute la structure."""
+def reward_tracking_scope():
+    """Un registre actif unique est partagé par les cinq comptes."""
+    return "shared:reward_tracking:current"
+
+
+def legacy_reward_tracking_scope(month):
+    """Clé utilisée avant la mise en place du registre collectif unique."""
     return ":".join(
         [
             "shared",
@@ -1140,6 +1145,87 @@ def build_reward_tracking_table(creator_results, saved_rows=None):
     return pd.DataFrame(tracking_rows, columns=REWARD_TRACKING_COLUMNS)
 
 
+def reward_creator_key(value):
+    """Construit une clé stable sans modifier le pseudo affiché."""
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def merge_collective_reward_tracking_rows(
+    remote_rows,
+    local_rows,
+    baseline_rows,
+    local_creators,
+):
+    """Fusionne une sauvegarde sans effacer le travail d'un autre compte."""
+    remote_rows = clean_reward_tracking_rows(remote_rows)
+    local_rows = clean_reward_tracking_rows(local_rows)
+    baseline_rows = clean_reward_tracking_rows(baseline_rows)
+
+    def rows_by_creator(rows):
+        return {
+            reward_creator_key(row["Créateur"]): row
+            for row in rows
+            if reward_creator_key(row["Créateur"])
+        }
+
+    remote_by_creator = rows_by_creator(remote_rows)
+    local_by_creator = rows_by_creator(local_rows)
+    baseline_by_creator = rows_by_creator(baseline_rows)
+    local_creator_keys = {
+        reward_creator_key(creator)
+        for creator in local_creators
+        if reward_creator_key(creator)
+    }
+
+    ordered_keys = list(remote_by_creator)
+    ordered_keys.extend(
+        key for key in local_by_creator if key not in remote_by_creator
+    )
+    manual_columns = (
+        "Date",
+        "Heure",
+        "Type d’événement",
+        "Rémunération consultant / responsable",
+    )
+    merged_rows = []
+
+    for creator_key in ordered_keys:
+        remote_row = remote_by_creator.get(creator_key)
+        local_row = local_by_creator.get(creator_key)
+        baseline_row = baseline_by_creator.get(creator_key)
+
+        if local_row is None:
+            merged_rows.append(remote_row)
+            continue
+        if remote_row is None:
+            merged_rows.append(local_row)
+            continue
+
+        merged_row = dict(remote_row)
+        if creator_key in local_creator_keys:
+            merged_row["Récompense créateur"] = local_row[
+                "Récompense créateur"
+            ]
+
+        for column in manual_columns:
+            local_value = local_row.get(column)
+            baseline_value = (
+                baseline_row.get(column)
+                if baseline_row is not None
+                else None
+            )
+            if baseline_row is None or local_value != baseline_value:
+                merged_row[column] = local_value
+
+        merged_row["Total récompense"] = (
+            merged_row["Récompense créateur"]
+            + merged_row["Rémunération consultant / responsable"]
+        )
+        merged_rows.append(merged_row)
+
+    return clean_reward_tracking_rows(merged_rows)
+
+
 def synchronize_reward_tracking_editor():
     """Recalcule le total dès qu’une cellule manuelle est modifiée."""
     current_table = st.session_state.get("reward_tracking_table")
@@ -1201,6 +1287,10 @@ def reset_calculations():
         "reward_tracking_signature",
         "reward_tracking_editor",
         "reward_tracking_loaded_scope",
+        "reward_tracking_baseline_rows",
+        "reward_tracking_active_month",
+        "reward_tracking_last_saved_at",
+        "reward_tracking_last_saved_by",
         "reward_tracking_save_notice",
     ):
         st.session_state.pop(key, None)
@@ -3210,13 +3300,17 @@ elif page == "🎁 Suivi récompenses":
         st.session_state.pop("reward_tracking_loaded_scope", None)
         st.session_state.pop("reward_tracking_editor", None)
         st.session_state.pop("reward_tracking_table", None)
+        st.session_state.pop("reward_tracking_baseline_rows", None)
+        st.session_state.pop("reward_tracking_active_month", None)
+        st.session_state.pop("reward_tracking_last_saved_at", None)
+        st.session_state.pop("reward_tracking_last_saved_by", None)
 
     if not persistent_settings_available:
-        st.warning(
-            "Le partage entre les comptes est indisponible tant que la "
+        st.error(
+            "⛔ Le partage entre les comptes est indisponible tant que la "
             "base PostgreSQL n'est pas connectée dans les Secrets "
-            "Streamlit. Chaque navigateur voit alors uniquement sa propre "
-            "session."
+            "Streamlit. L'enregistrement collectif est désactivé pour "
+            "éviter de faire croire qu'une saisie locale est partagée."
         )
 
     creator_results_for_tracking = pd.DataFrame(
@@ -3248,18 +3342,46 @@ elif page == "🎁 Suivi récompenses":
             st.session_state.creator_results.copy()
         )
 
-    tracking_scope = reward_tracking_scope(st.session_state.month)
+    tracking_scope = reward_tracking_scope()
     if (
         st.session_state.get("reward_tracking_loaded_scope")
         != tracking_scope
     ):
+        saved_tracking_payload = {}
         saved_tracking_rows = []
         if persistent_settings_available:
             try:
-                saved_tracking_rows = load_persistent_scope(
+                saved_tracking_payload = load_persistent_scope(
                     database_url,
                     tracking_scope,
-                ).get("rows", [])
+                )
+                saved_tracking_rows = saved_tracking_payload.get("rows", [])
+
+                # Migration transparente depuis l'ancien stockage séparé
+                # par mois. Elle ne s'exécute qu'une seule fois, lorsque le
+                # registre collectif unique est encore vide.
+                if not saved_tracking_payload:
+                    legacy_payload = load_persistent_scope(
+                        database_url,
+                        legacy_reward_tracking_scope(st.session_state.month),
+                    )
+                    legacy_rows = legacy_payload.get("rows", [])
+                    if legacy_rows:
+                        saved_tracking_payload = {
+                            "month": legacy_payload.get(
+                                "month",
+                                st.session_state.month,
+                            ),
+                            "rows": clean_reward_tracking_rows(legacy_rows),
+                            "saved_at": legacy_payload.get("saved_at"),
+                            "saved_by": legacy_payload.get("saved_by"),
+                        }
+                        save_persistent_scopes(
+                            database_url,
+                            {tracking_scope: saved_tracking_payload},
+                            current_user_email,
+                        )
+                        saved_tracking_rows = saved_tracking_payload["rows"]
             except Exception:
                 st.warning(
                     "Le suivi collectif enregistré ne peut pas être chargé "
@@ -3271,6 +3393,18 @@ elif page == "🎁 Suivi récompenses":
                 creator_results_for_tracking,
                 saved_tracking_rows,
             )
+        )
+        st.session_state.reward_tracking_baseline_rows = (
+            st.session_state.reward_tracking_table.to_dict("records")
+        )
+        st.session_state.reward_tracking_active_month = (
+            saved_tracking_payload.get("month") or st.session_state.month
+        )
+        st.session_state.reward_tracking_last_saved_at = (
+            saved_tracking_payload.get("saved_at")
+        )
+        st.session_state.reward_tracking_last_saved_by = (
+            saved_tracking_payload.get("saved_by")
         )
         st.session_state.reward_tracking_loaded_scope = tracking_scope
         st.session_state.pop("reward_tracking_editor", None)
@@ -3284,6 +3418,34 @@ elif page == "🎁 Suivi récompenses":
                 ).to_dict("records"),
             )
         )
+
+    active_tracking_month = st.session_state.get(
+        "reward_tracking_active_month",
+        st.session_state.month,
+    )
+    if persistent_settings_available:
+        st.success(
+            "☁️ Registre collectif unique actif : toutes les directions "
+            "enregistrent désormais dans le même tableau."
+        )
+    last_tracking_save = st.session_state.get(
+        "reward_tracking_last_saved_at"
+    )
+    last_tracking_author = normalize_email(
+        st.session_state.get("reward_tracking_last_saved_by")
+    )
+    if last_tracking_save:
+        last_tracking_author_name = AUTHORIZED_USERS.get(
+            last_tracking_author,
+            {},
+        ).get("name", last_tracking_author or "un utilisateur autorisé")
+        st.caption(
+            f"Mois collectif actif : {active_tracking_month} • "
+            f"Dernière sauvegarde : {last_tracking_save} • "
+            f"Par : {last_tracking_author_name}"
+        )
+    else:
+        st.caption(f"Mois collectif actif : {active_tracking_month}")
 
     tracking_table = st.session_state.reward_tracking_table.copy()
     if tracking_table.empty:
@@ -3383,26 +3545,68 @@ elif page == "🎁 Suivi récompenses":
         key="save_collective_reward_tracking",
         type="primary",
         use_container_width=True,
+        disabled=not persistent_settings_available,
     ):
         if persistent_settings_available:
             try:
+                latest_tracking_payload = load_persistent_scope(
+                    database_url,
+                    tracking_scope,
+                )
+                local_creator_names = (
+                    creator_results_for_tracking["Pseudo"]
+                    .fillna("")
+                    .astype(str)
+                    .tolist()
+                    if "Pseudo" in creator_results_for_tracking.columns
+                    else []
+                )
+                merged_tracking_rows = (
+                    merge_collective_reward_tracking_rows(
+                        remote_rows=latest_tracking_payload.get("rows", []),
+                        local_rows=cleaned_tracking_rows,
+                        baseline_rows=st.session_state.get(
+                            "reward_tracking_baseline_rows",
+                            [],
+                        ),
+                        local_creators=local_creator_names,
+                    )
+                )
+                saved_at = datetime.now().isoformat(timespec="seconds")
+                shared_active_month = latest_tracking_payload.get(
+                    "month"
+                ) or active_tracking_month
                 save_persistent_scopes(
                     database_url,
                     {
                         tracking_scope: {
-                            "month": st.session_state.month,
-                            "rows": cleaned_tracking_rows,
-                            "saved_at": datetime.now().isoformat(
-                                timespec="seconds"
-                            ),
+                            "month": shared_active_month,
+                            "rows": merged_tracking_rows,
+                            "saved_at": saved_at,
                             "saved_by": current_user_email,
                         }
                     },
                     current_user_email,
                 )
+                st.session_state.reward_tracking_table = (
+                    build_reward_tracking_table(
+                        creator_results_for_tracking,
+                        merged_tracking_rows,
+                    )
+                )
+                st.session_state.reward_tracking_baseline_rows = (
+                    st.session_state.reward_tracking_table.to_dict("records")
+                )
+                st.session_state.reward_tracking_active_month = (
+                    shared_active_month
+                )
+                st.session_state.reward_tracking_last_saved_at = saved_at
+                st.session_state.reward_tracking_last_saved_by = (
+                    current_user_email
+                )
                 st.success(
-                    "Le suivi collectif est enregistré définitivement et "
-                    "restera disponible après déconnexion."
+                    "Le suivi collectif est enregistré et fusionné avec les "
+                    "dernières saisies des autres directions."
                 )
             except Exception:
                 st.error(
@@ -3439,9 +3643,9 @@ elif page == "🎁 Suivi récompenses":
     tracking_delete_generation = int(
         st.session_state.get("reward_tracking_delete_generation", 0)
     )
-    tracking_month_key = safe_export_name(st.session_state.month)
+    tracking_month_key = safe_export_name(active_tracking_month)
     with st.expander(
-        f"🗑️ Réinitialiser le suivi collectif — {st.session_state.month}"
+        f"🗑️ Réinitialiser le suivi collectif — {active_tracking_month}"
     ):
         st.warning(
             "Cette suppression est collective : les informations manuelles "
@@ -3467,9 +3671,20 @@ elif page == "🎁 Suivi récompenses":
         ):
             if persistent_settings_available:
                 try:
-                    delete_persistent_scopes(
+                    reset_saved_at = datetime.now().isoformat(
+                        timespec="seconds"
+                    )
+                    save_persistent_scopes(
                         database_url,
-                        [tracking_scope],
+                        {
+                            tracking_scope: {
+                                "month": st.session_state.month,
+                                "rows": [],
+                                "saved_at": reset_saved_at,
+                                "saved_by": current_user_email,
+                            }
+                        },
+                        current_user_email,
                     )
                     st.session_state.pop(
                         "reward_tracking_loaded_scope",
@@ -3477,6 +3692,22 @@ elif page == "🎁 Suivi récompenses":
                     )
                     st.session_state.pop("reward_tracking_editor", None)
                     st.session_state.pop("reward_tracking_table", None)
+                    st.session_state.pop(
+                        "reward_tracking_baseline_rows",
+                        None,
+                    )
+                    st.session_state.pop(
+                        "reward_tracking_active_month",
+                        None,
+                    )
+                    st.session_state.pop(
+                        "reward_tracking_last_saved_at",
+                        None,
+                    )
+                    st.session_state.pop(
+                        "reward_tracking_last_saved_by",
+                        None,
+                    )
                     st.session_state.reward_tracking_delete_generation = (
                         tracking_delete_generation + 1
                     )
