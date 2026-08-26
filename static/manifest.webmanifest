@@ -1,0 +1,9 @@
+{
+  "name": "Pro Consulting",
+  "short_name": "Pro Consulting",
+  "description": "Pilotage et chat collectif Pro Consulting",
+  "start_url": "/?page=chat",
+  "display": "standalone",
+  "background_color": "#071927",
+  "theme_color": "#007c86"
+}
