@@ -1,3 +1,4 @@
+import base64
 import json
 import hashlib
 import re
@@ -6,6 +7,9 @@ import unicodedata
 import pandas as pd
 import psycopg
 import streamlit as st
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from datetime import datetime
 from html import escape
 from io import BytesIO, StringIO
@@ -14,6 +18,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
+from pywebpush import WebPushException, webpush
 
 from utils import (
     calculate_consultant_rewards,
@@ -176,6 +181,30 @@ st.markdown(
     [data-baseweb="input"] input,
     [data-baseweb="select"] input,
     [data-baseweb="textarea"] textarea {
+        color: var(--pc-cream) !important;
+    }
+
+    [data-testid="stTextArea"] [data-baseweb="textarea"],
+    [data-testid="stTextArea"] [data-baseweb="textarea"] > div,
+    [data-testid="stTextArea"] textarea {
+        border-color: rgba(115, 255, 240, 0.48) !important;
+        background: #071d2b !important;
+        color: #fff8ea !important;
+    }
+
+    [data-testid="stTextArea"] textarea {
+        caret-color: var(--pc-gold) !important;
+        -webkit-text-fill-color: #fff8ea !important;
+    }
+
+    [data-testid="stTextArea"] textarea::placeholder {
+        color: rgba(255, 248, 234, 0.58) !important;
+        -webkit-text-fill-color: rgba(255, 248, 234, 0.58) !important;
+        opacity: 1 !important;
+    }
+
+    [data-testid="stTextArea"] label,
+    [data-testid="stTextArea"] label p {
         color: var(--pc-cream) !important;
     }
 
@@ -742,6 +771,40 @@ def initialize_settings_database(database_url):
                 ON pro_consulting_chat_messages (channel, expires_at)
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pro_consulting_chat_reads (
+                    user_email TEXT PRIMARY KEY,
+                    last_seen_message_id BIGINT NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS
+                    pro_consulting_push_subscriptions (
+                        endpoint TEXT PRIMARY KEY,
+                        user_email TEXT NOT NULL,
+                        subscription JSONB NOT NULL,
+                        active BOOLEAN NOT NULL DEFAULT TRUE,
+                        created_at TIMESTAMPTZ NOT NULL
+                            DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMPTZ NOT NULL
+                            DEFAULT CURRENT_TIMESTAMP
+                    )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                    pro_consulting_push_subscriptions_user_idx
+                ON pro_consulting_push_subscriptions (
+                    user_email,
+                    active
+                )
+                """
+            )
         connection.commit()
 
     return True
@@ -856,6 +919,516 @@ def legacy_reward_tracking_scope(month):
 
 CHAT_RETENTION_HOURS = 48
 CHAT_MAX_MESSAGE_LENGTH = 2000
+WEB_PUSH_KEYS_SCOPE = "system:web_push_keys:v1"
+
+
+CHAT_PUSH_COMPONENT_HTML = """
+<div class="pc-push-control">
+    <button type="button" data-pc-push-button>
+        🔔 Activer les notifications mobiles
+    </button>
+    <div data-pc-push-status class="pc-push-status">
+        Recevez une alerte lorsqu’un nouveau message est publié.
+    </div>
+</div>
+"""
+
+
+CHAT_PUSH_COMPONENT_CSS = """
+.pc-push-control {
+    display: grid;
+    gap: 0.55rem;
+    width: 100%;
+}
+
+.pc-push-control button {
+    min-height: 2.75rem;
+    width: 100%;
+    padding: 0.65rem 1rem;
+    border: 1px solid rgba(255, 200, 87, 0.78);
+    border-radius: 12px;
+    background: linear-gradient(105deg, #f4b942 0%, #ffd166 52%, #00d7c8 145%);
+    color: #071b25;
+    font: inherit;
+    font-weight: 760;
+    cursor: pointer;
+}
+
+.pc-push-control button:disabled {
+    cursor: default;
+    opacity: 0.78;
+}
+
+.pc-push-status {
+    color: rgba(255, 248, 234, 0.78);
+    font-size: 0.83rem;
+    line-height: 1.4;
+}
+"""
+
+
+CHAT_PUSH_COMPONENT_JS = """
+export default function(component) {
+    const { data, parentElement, setStateValue } = component;
+    const button = parentElement.querySelector('[data-pc-push-button]');
+    const status = parentElement.querySelector('[data-pc-push-status]');
+    const publicKey = data.public_key;
+
+    const publishState = (permission, subscription, message) => {
+        setStateValue('push_state', JSON.stringify({
+            permission,
+            subscription,
+            message,
+        }));
+    };
+
+    const setStatus = (message, enabled = true) => {
+        status.textContent = message;
+        button.disabled = !enabled;
+    };
+
+    const toUint8Array = (base64String) => {
+        const padding = '='.repeat((4 - base64String.length % 4) % 4);
+        const base64 = (base64String + padding)
+            .replace(/-/g, '+')
+            .replace(/_/g, '/');
+        const rawData = window.atob(base64);
+        return Uint8Array.from([...rawData].map((char) => char.charCodeAt(0)));
+    };
+
+    const ensureManifest = () => {
+        if (document.querySelector('link[data-pc-chat-manifest]')) return;
+        const manifest = document.createElement('link');
+        manifest.rel = 'manifest';
+        manifest.href = '/app/static/manifest.webmanifest';
+        manifest.dataset.pcChatManifest = 'true';
+        document.head.appendChild(manifest);
+    };
+
+    const getRegistration = async () => {
+        let registration = await navigator.serviceWorker.getRegistration(
+            '/app/static/'
+        );
+        if (!registration) {
+            registration = await navigator.serviceWorker.register(
+                '/app/static/chat-push-sw.js',
+                { scope: '/app/static/' }
+            );
+        }
+        return registration;
+    };
+
+    const inspectSubscription = async () => {
+        ensureManifest();
+        if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+            setStatus(
+                'Ce navigateur ne prend pas en charge les notifications mobiles.',
+                false
+            );
+            publishState('unsupported', null, 'Navigateur non compatible');
+            return;
+        }
+
+        if (!('Notification' in window)) {
+            setStatus(
+                'Les notifications ne sont pas disponibles dans ce navigateur.',
+                false
+            );
+            publishState('unsupported', null, 'Notifications indisponibles');
+            return;
+        }
+
+        const registration = await navigator.serviceWorker.getRegistration(
+            '/app/static/'
+        );
+        const subscription = registration
+            ? await registration.pushManager.getSubscription()
+            : null;
+        if (Notification.permission === 'granted' && subscription) {
+            button.textContent = '✅ Notifications mobiles activées';
+            setStatus(
+                'Ce téléphone recevra les nouveaux messages du chat.',
+                false
+            );
+            publishState(
+                'granted',
+                subscription.toJSON(),
+                'Notifications activées'
+            );
+        } else if (Notification.permission === 'denied') {
+            button.textContent = '🔕 Notifications bloquées';
+            setStatus(
+                'Autorisez les notifications dans les réglages du navigateur.',
+                false
+            );
+            publishState('denied', null, 'Autorisation refusée');
+        }
+    };
+
+    button.onclick = async () => {
+        try {
+            const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent);
+            const isStandalone = window.matchMedia(
+                '(display-mode: standalone)'
+            ).matches || window.navigator.standalone === true;
+            if (isIos && !isStandalone) {
+                setStatus(
+                    'Sur iPhone, ajoutez d’abord l’application à l’écran d’accueil, puis ouvrez-la depuis son icône.'
+                );
+                publishState(
+                    'ios_home_screen_required',
+                    null,
+                    'Ajout à l’écran d’accueil requis'
+                );
+                return;
+            }
+
+            const permission = await Notification.requestPermission();
+            if (permission !== 'granted') {
+                button.textContent = '🔕 Notifications non autorisées';
+                setStatus(
+                    'Vous pourrez les autoriser depuis les réglages du navigateur.',
+                    false
+                );
+                publishState(permission, null, 'Autorisation non accordée');
+                return;
+            }
+
+            setStatus('Activation en cours…', false);
+            const registration = await getRegistration();
+            let subscription = await registration.pushManager.getSubscription();
+            if (!subscription) {
+                subscription = await registration.pushManager.subscribe({
+                    userVisibleOnly: true,
+                    applicationServerKey: toUint8Array(publicKey),
+                });
+            }
+            button.textContent = '✅ Notifications mobiles activées';
+            setStatus(
+                'Ce téléphone recevra les nouveaux messages du chat.',
+                false
+            );
+            publishState(
+                'granted',
+                subscription.toJSON(),
+                'Notifications activées'
+            );
+        } catch (error) {
+            button.textContent = '🔔 Réessayer l’activation';
+            setStatus(
+                'L’activation a échoué sur ce téléphone. Vous pouvez réessayer.'
+            );
+            publishState('error', null, String(error));
+        }
+    };
+
+    inspectSubscription().catch((error) => {
+        setStatus('Impossible de vérifier les notifications sur ce téléphone.');
+        publishState('error', null, String(error));
+    });
+
+    return () => {
+        button.onclick = null;
+    };
+}
+"""
+
+
+chat_push_component = st.components.v2.component(
+    "pro_consulting_chat_push",
+    html=CHAT_PUSH_COMPONENT_HTML,
+    css=CHAT_PUSH_COMPONENT_CSS,
+    js=CHAT_PUSH_COMPONENT_JS,
+)
+
+
+def base64url_without_padding(value):
+    """Encode les clés Web Push au format URL-safe attendu."""
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def get_or_create_web_push_keys(database_url):
+    """Crée une seule paire VAPID et la conserve uniquement côté serveur."""
+    initialize_settings_database(database_url)
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT payload
+                FROM pro_consulting_settings
+                WHERE scope = %s
+                """,
+                (WEB_PUSH_KEYS_SCOPE,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                private_key = ec.generate_private_key(ec.SECP256R1())
+                private_der = private_key.private_bytes(
+                    encoding=serialization.Encoding.DER,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
+                public_point = private_key.public_key().public_bytes(
+                    encoding=serialization.Encoding.X962,
+                    format=serialization.PublicFormat.UncompressedPoint,
+                )
+                generated_payload = {
+                    "private_key": base64url_without_padding(private_der),
+                    "public_key": base64url_without_padding(public_point),
+                }
+                cursor.execute(
+                    """
+                    INSERT INTO pro_consulting_settings (
+                        scope,
+                        payload,
+                        updated_by
+                    )
+                    VALUES (%s, %s::jsonb, 'system:web_push')
+                    ON CONFLICT (scope) DO NOTHING
+                    """,
+                    (
+                        WEB_PUSH_KEYS_SCOPE,
+                        json.dumps(generated_payload),
+                    ),
+                )
+                connection.commit()
+                cursor.execute(
+                    """
+                    SELECT payload
+                    FROM pro_consulting_settings
+                    WHERE scope = %s
+                    """,
+                    (WEB_PUSH_KEYS_SCOPE,),
+                )
+                row = cursor.fetchone()
+
+    if row is None:
+        raise RuntimeError("Les clés de notification n’ont pas pu être créées.")
+    payload = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+    private_key = str(payload.get("private_key", "")).strip()
+    public_key = str(payload.get("public_key", "")).strip()
+    if not private_key or not public_key:
+        raise RuntimeError("Les clés de notification enregistrées sont invalides.")
+    return {"private_key": private_key, "public_key": public_key}
+
+
+def save_chat_push_subscription(database_url, user_email, subscription):
+    """Enregistre ou réactive l’abonnement du navigateur connecté."""
+    if not isinstance(subscription, dict):
+        raise ValueError("Abonnement mobile invalide.")
+    endpoint = str(subscription.get("endpoint", "")).strip()
+    subscription_keys = subscription.get("keys", {})
+    p256dh = str(subscription_keys.get("p256dh", "")).strip()
+    auth = str(subscription_keys.get("auth", "")).strip()
+    if not endpoint.startswith("https://") or not p256dh or not auth:
+        raise ValueError("Abonnement mobile incomplet.")
+
+    cleaned_subscription = {
+        "endpoint": endpoint,
+        "expirationTime": subscription.get("expirationTime"),
+        "keys": {"p256dh": p256dh, "auth": auth},
+    }
+    initialize_settings_database(database_url)
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO pro_consulting_push_subscriptions (
+                    endpoint,
+                    user_email,
+                    subscription,
+                    active
+                )
+                VALUES (%s, %s, %s::jsonb, TRUE)
+                ON CONFLICT (endpoint)
+                DO UPDATE SET
+                    user_email = EXCLUDED.user_email,
+                    subscription = EXCLUDED.subscription,
+                    active = TRUE,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    endpoint,
+                    normalize_email(user_email),
+                    json.dumps(cleaned_subscription),
+                ),
+            )
+        connection.commit()
+    return endpoint
+
+
+def load_chat_notification_summary(database_url, user_email):
+    """Retourne le nombre de messages collectifs non encore consultés."""
+    normalized_email = normalize_email(user_email)
+    initialize_settings_database(database_url)
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT last_seen_message_id
+                FROM pro_consulting_chat_reads
+                WHERE user_email = %s
+                """,
+                (normalized_email,),
+            )
+            read_row = cursor.fetchone()
+            last_seen_message_id = int(read_row[0]) if read_row else 0
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    COALESCE(MAX(id), 0)
+                FROM pro_consulting_chat_messages
+                WHERE channel = 'general'
+                  AND expires_at > CURRENT_TIMESTAMP
+                  AND id > %s
+                  AND author_email <> %s
+                """,
+                (last_seen_message_id, normalized_email),
+            )
+            unread_count, latest_unread_id = cursor.fetchone()
+            latest_message = None
+            if int(unread_count):
+                cursor.execute(
+                    """
+                    SELECT author_name, message
+                    FROM pro_consulting_chat_messages
+                    WHERE id = %s
+                    """,
+                    (int(latest_unread_id),),
+                )
+                message_row = cursor.fetchone()
+                if message_row:
+                    latest_message = {
+                        "author_name": str(message_row[0]),
+                        "message": str(message_row[1]),
+                    }
+
+    return {
+        "unread_count": int(unread_count),
+        "latest_unread_id": int(latest_unread_id),
+        "latest_message": latest_message,
+    }
+
+
+def mark_collective_chat_read(database_url, user_email, message_id):
+    """Mémorise le dernier message affiché pour ce collaborateur."""
+    if not message_id:
+        return
+    initialize_settings_database(database_url)
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO pro_consulting_chat_reads (
+                    user_email,
+                    last_seen_message_id
+                )
+                VALUES (%s, %s)
+                ON CONFLICT (user_email)
+                DO UPDATE SET
+                    last_seen_message_id = GREATEST(
+                        pro_consulting_chat_reads.last_seen_message_id,
+                        EXCLUDED.last_seen_message_id
+                    ),
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (normalize_email(user_email), int(message_id)),
+            )
+        connection.commit()
+
+
+def deactivate_chat_push_subscription(database_url, endpoint):
+    """Désactive une destination refusée définitivement par le navigateur."""
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE pro_consulting_push_subscriptions
+                SET active = FALSE,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE endpoint = %s
+                """,
+                (endpoint,),
+            )
+        connection.commit()
+
+
+def send_collective_chat_push_notifications(
+    database_url,
+    author_email,
+    author_name,
+    message,
+    message_id,
+):
+    """Envoie le nouveau message aux téléphones abonnés, sauf à l’auteur."""
+    web_push_keys = get_or_create_web_push_keys(database_url)
+    normalized_author = normalize_email(author_email)
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT endpoint, subscription
+                FROM pro_consulting_push_subscriptions
+                WHERE active = TRUE
+                  AND user_email <> %s
+                """,
+                (normalized_author,),
+            )
+            subscriptions = cursor.fetchall()
+
+    cleaned_message = " ".join(str(message or "").split())
+    if len(cleaned_message) > 160:
+        cleaned_message = cleaned_message[:157].rstrip() + "…"
+    payload = json.dumps(
+        {
+            "title": f"Nouveau message de {author_name}",
+            "body": cleaned_message,
+            "url": f"/?page=chat&message={int(message_id)}",
+            "tag": "pro-consulting-chat",
+        },
+        ensure_ascii=False,
+    )
+    def send_to_subscription(endpoint, subscription):
+        subscription_payload = (
+            subscription
+            if isinstance(subscription, dict)
+            else json.loads(subscription)
+        )
+        try:
+            webpush(
+                subscription_info=subscription_payload,
+                data=payload,
+                vapid_private_key=web_push_keys["private_key"],
+                vapid_claims={
+                    "sub": "mailto:tomeventfrance@gmail.com",
+                },
+                timeout=6,
+            )
+            return True
+        except WebPushException as error:
+            response = getattr(error, "response", None)
+            if response is not None and response.status_code in (404, 410):
+                deactivate_chat_push_subscription(database_url, endpoint)
+        except Exception:
+            pass
+        return False
+
+    sent_count = 0
+    if subscriptions:
+        with ThreadPoolExecutor(
+            max_workers=min(8, len(subscriptions))
+        ) as executor:
+            futures = [
+                executor.submit(send_to_subscription, endpoint, subscription)
+                for endpoint, subscription in subscriptions
+            ]
+            for future in as_completed(futures):
+                try:
+                    sent_count += int(bool(future.result()))
+                except Exception:
+                    continue
+    return sent_count
 
 
 def load_collective_chat_messages(database_url, limit=250):
@@ -940,6 +1513,7 @@ def save_collective_chat_message(
                     %s,
                     CURRENT_TIMESTAMP + INTERVAL '48 hours'
                 )
+                RETURNING id
                 """,
                 (
                     normalize_email(author_email),
@@ -948,7 +1522,9 @@ def save_collective_chat_message(
                     cleaned_message,
                 ),
             )
+            inserted_message_id = cursor.fetchone()[0]
         connection.commit()
+    return int(inserted_message_id)
 
 
 def format_chat_datetime(value):
@@ -2417,6 +2993,11 @@ if st.session_state.get("active_user_email") != current_user_email:
     st.session_state.pop("admin_director_management_config", None)
     st.session_state.pop("admin_collaborator_access_loaded", None)
     st.session_state.pop("admin_collaborator_access_rows", None)
+    st.session_state.pop("chat_push_saved_endpoint", None)
+    st.session_state.pop("last_internal_chat_toast_id", None)
+    st.session_state.pop("last_rendered_chat_message_id", None)
+    st.session_state.pop("last_read_chat_message_id", None)
+    st.session_state.pop("handled_chat_deeplink", None)
     st.session_state.active_user_email = current_user_email
 
 persistent_settings_available = database_url is not None
@@ -2572,10 +3153,85 @@ pages_by_role = {
     "performance_manager": performance_manager_pages,
 }
 
+CHAT_PAGE_LABEL = "💬 Chat collectif"
+requested_page = str(st.query_params.get("page", "")).strip().casefold()
+requested_message = str(st.query_params.get("message", "")).strip()
+chat_deeplink_token = f"{requested_page}:{requested_message}"
+if (
+    requested_page == "chat"
+    and st.session_state.get("handled_chat_deeplink")
+    != chat_deeplink_token
+):
+    st.session_state.main_navigation_page = CHAT_PAGE_LABEL
+    st.session_state.handled_chat_deeplink = chat_deeplink_token
+
 page = st.sidebar.radio(
     "Navigation",
     pages_by_role.get(current_user_role, []),
+    key="main_navigation_page",
 )
+
+
+def open_collective_chat_from_notification():
+    """Ouvre le chat depuis l’alerte interne de la barre latérale."""
+    st.session_state.main_navigation_page = CHAT_PAGE_LABEL
+    st.rerun(scope="app")
+
+
+if persistent_settings_available:
+    internal_notification_fragment = (
+        st.fragment(run_every="10s")
+        if hasattr(st, "fragment")
+        else (lambda function: function)
+    )
+
+    @internal_notification_fragment
+    def render_internal_chat_notification():
+        try:
+            notification_summary = load_chat_notification_summary(
+                database_url,
+                current_user_email,
+            )
+        except Exception:
+            return
+
+        unread_count = notification_summary["unread_count"]
+        latest_unread_id = notification_summary["latest_unread_id"]
+        if not unread_count or page == CHAT_PAGE_LABEL:
+            return
+
+        latest_message = notification_summary.get("latest_message") or {}
+        latest_author = latest_message.get("author_name", "Un collaborateur")
+        latest_body = " ".join(
+            str(latest_message.get("message", "")).split()
+        )
+        if len(latest_body) > 90:
+            latest_body = latest_body[:87].rstrip() + "…"
+
+        if (
+            st.session_state.get("last_internal_chat_toast_id")
+            != latest_unread_id
+        ):
+            toast_message = f"Nouveau message de {latest_author}"
+            if latest_body:
+                toast_message += f" : {latest_body}"
+            st.toast(toast_message, icon="💬")
+            st.session_state.last_internal_chat_toast_id = latest_unread_id
+
+        with st.sidebar:
+            st.warning(
+                f"🔔 {unread_count} nouveau"
+                f"{'x' if unread_count > 1 else ''} message"
+                f"{'s' if unread_count > 1 else ''} dans le chat."
+            )
+            st.button(
+                "💬 Ouvrir le chat",
+                key="open_collective_chat_notification",
+                on_click=open_collective_chat_from_notification,
+                use_container_width=True,
+            )
+
+    render_internal_chat_notification()
 
 # Le suivi est partagé entre plusieurs sessions Streamlit. Lorsqu'un
 # utilisateur revient sur cette page, on recharge systématiquement la copie
@@ -2638,6 +3294,64 @@ elif page == "💬 Chat collectif":
             st.warning(persistent_settings_error)
         st.stop()
 
+    try:
+        web_push_keys = get_or_create_web_push_keys(database_url)
+        with st.expander(
+            "🔔 Notifications mobiles du chat",
+            expanded=not bool(
+                st.session_state.get("chat_push_saved_endpoint")
+            ),
+        ):
+            st.caption(
+                "L’activation est propre à chaque téléphone et à chaque "
+                "navigateur. Aucun collaborateur n’est obligé de l’accepter."
+            )
+            push_component_result = chat_push_component(
+                data={"public_key": web_push_keys["public_key"]},
+                key=f"chat_push_{safe_export_name(current_user_email)}",
+                on_push_state_change=lambda: None,
+            )
+            push_state_value = getattr(
+                push_component_result,
+                "push_state",
+                None,
+            )
+            if push_state_value:
+                push_state = (
+                    json.loads(push_state_value)
+                    if isinstance(push_state_value, str)
+                    else dict(push_state_value)
+                )
+                push_subscription = push_state.get("subscription")
+                if push_subscription:
+                    push_endpoint = str(
+                        push_subscription.get("endpoint", "")
+                    )
+                    if (
+                        push_endpoint
+                        and st.session_state.get(
+                            "chat_push_saved_endpoint"
+                        )
+                        != push_endpoint
+                    ):
+                        saved_endpoint = save_chat_push_subscription(
+                            database_url,
+                            current_user_email,
+                            push_subscription,
+                        )
+                        st.session_state.chat_push_saved_endpoint = (
+                            saved_endpoint
+                        )
+                        st.toast(
+                            "Notifications mobiles activées sur ce téléphone.",
+                            icon="🔔",
+                        )
+    except Exception:
+        st.warning(
+            "Les notifications mobiles ne peuvent pas être configurées "
+            "pour le moment. Le chat et les alertes internes restent actifs."
+        )
+
     st.caption(
         "🔄 Actualisation automatique toutes les 10 secondes • "
         "Conservation maximale : 48 heures"
@@ -2665,6 +3379,48 @@ elif page == "💬 Chat collectif":
                 "tous les collaborateurs autorisés."
             )
             return
+
+        latest_chat_message_id = int(chat_messages[-1]["id"])
+        previous_rendered_message_id = int(
+            st.session_state.get("last_rendered_chat_message_id", 0)
+        )
+        if (
+            previous_rendered_message_id
+            and latest_chat_message_id > previous_rendered_message_id
+        ):
+            new_external_messages = [
+                message
+                for message in chat_messages
+                if int(message["id"]) > previous_rendered_message_id
+                and normalize_email(message["author_email"])
+                != normalize_email(current_user_email)
+            ]
+            if new_external_messages:
+                newest_message = new_external_messages[-1]
+                st.toast(
+                    "Nouveau message de "
+                    f"{newest_message['author_name']}.",
+                    icon="💬",
+                )
+        st.session_state.last_rendered_chat_message_id = (
+            latest_chat_message_id
+        )
+
+        if (
+            int(st.session_state.get("last_read_chat_message_id", 0))
+            < latest_chat_message_id
+        ):
+            try:
+                mark_collective_chat_read(
+                    database_url,
+                    current_user_email,
+                    latest_chat_message_id,
+                )
+                st.session_state.last_read_chat_message_id = (
+                    latest_chat_message_id
+                )
+            except Exception:
+                pass
 
         for chat_message in chat_messages:
             displayed_author_name = AUTHORIZED_USERS.get(
@@ -2724,13 +3480,23 @@ elif page == "💬 Chat collectif":
             st.warning("Écrivez un message avant de l’envoyer.")
         else:
             try:
-                save_collective_chat_message(
+                inserted_message_id = save_collective_chat_message(
                     database_url=database_url,
                     author_email=current_user_email,
                     author_name=current_user_name,
                     author_role=current_user_role,
                     message=chat_message_text,
                 )
+                try:
+                    send_collective_chat_push_notifications(
+                        database_url=database_url,
+                        author_email=current_user_email,
+                        author_name=current_user_name,
+                        message=chat_message_text,
+                        message_id=inserted_message_id,
+                    )
+                except Exception:
+                    pass
                 st.rerun()
             except ValueError as error:
                 st.warning(str(error))
