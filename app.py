@@ -3517,33 +3517,33 @@ elif page == "🔐 Accès collaborateurs":
     ]
 
     st.subheader("Ajouter un collaborateur")
-    selected_collaborator_email = st.selectbox(
-        "Adresse Google autorisée",
-        options=selectable_email_options,
-        help=(
-            "Les adresses déjà détectées dans l’export Backstage et les "
-            "exclusions sont proposées automatiquement."
-        ),
-        key="selected_existing_collaborator_email",
-    )
-
     with st.form("add_collaborator_access_form", clear_on_submit=True):
-        add_name_column, add_email_column = st.columns(2)
-        new_collaborator_name = add_name_column.text_input(
+        new_collaborator_name = st.text_input(
             "Nom affiché",
             placeholder="Exemple : Marie",
         )
-        if selected_collaborator_email == manual_email_option:
-            new_collaborator_email = add_email_column.text_input(
-                "Nouvelle adresse Google",
-                placeholder="nom@gmail.com",
-            )
+        selected_collaborator_email = st.selectbox(
+            "Adresse Google autorisée",
+            options=selectable_email_options,
+            help=(
+                "Sélectionnez une adresse détectée dans l’export Backstage "
+                "ou choisissez l’option de saisie manuelle."
+            ),
+            key="selected_existing_collaborator_email",
+        )
+        manual_collaborator_email = st.text_input(
+            "Adresse absente de la liste ? Ajoutez-la manuellement",
+            placeholder="nom@gmail.com",
+            help=(
+                "Ce champ reste toujours modifiable. Lorsqu’il est rempli, "
+                "l’adresse saisie remplace celle du menu déroulant."
+            ),
+        )
+        if str(manual_collaborator_email or "").strip():
+            new_collaborator_email = manual_collaborator_email
+        elif selected_collaborator_email == manual_email_option:
+            new_collaborator_email = ""
         else:
-            add_email_column.text_input(
-                "Adresse sélectionnée",
-                value=selected_collaborator_email,
-                disabled=True,
-            )
             new_collaborator_email = selected_collaborator_email
         add_role_column, add_groups_column = st.columns(2)
         new_collaborator_role_label = add_role_column.selectbox(
