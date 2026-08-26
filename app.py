@@ -922,7 +922,7 @@ def legacy_reward_tracking_scope(month):
 CHAT_RETENTION_HOURS = 48
 CHAT_MAX_MESSAGE_LENGTH = 2000
 WEB_PUSH_KEYS_SCOPE = "system:web_push_keys:v1"
-CHAT_PUSH_FRONTEND_VERSION = "v2_20260826"
+CHAT_PUSH_FRONTEND_VERSION = "v3_20260826"
 
 
 CHAT_PUSH_ASSETS_DIRECTORY = Path(__file__).parent / "chat_push_assets"
@@ -936,7 +936,7 @@ def chat_push_asset_url(filename):
     """Retourne l’URL publique d’un fichier du composant Web Push."""
     safe_filename = str(filename or "").strip().lstrip("/")
     return (
-        f"/component/{chat_push_assets_component.name}/"
+        f"component/{chat_push_assets_component.name}/"
         f"{safe_filename}"
     )
 
@@ -992,7 +992,10 @@ export default function(component) {
     const button = parentElement.querySelector('[data-pc-push-button]');
     const status = parentElement.querySelector('[data-pc-push-status]');
     const publicKey = data.public_key;
-    const workerUrl = new URL(data.worker_url, window.location.origin);
+    // Streamlit Cloud exécute l’application sous un chemin interne (/~/+/).
+    // Une URL relative conserve ce préfixe indispensable aux composants.
+    const workerUrl = new URL(data.worker_url, window.location.href);
+    const manifestUrl = new URL(data.manifest_url, window.location.href);
     const workerScope = new URL('./', workerUrl).pathname;
 
     const publishState = (permission, subscription, message) => {
@@ -1021,7 +1024,7 @@ export default function(component) {
         if (document.querySelector('link[data-pc-chat-manifest]')) return;
         const manifest = document.createElement('link');
         manifest.rel = 'manifest';
-        manifest.href = data.manifest_url;
+        manifest.href = manifestUrl.href;
         manifest.dataset.pcChatManifest = 'true';
         document.head.appendChild(manifest);
     };
@@ -1138,7 +1141,7 @@ export default function(component) {
             button.textContent = '🔔 Réessayer l’activation';
             const errorMessage = error?.message || String(error);
             setStatus(
-                'Activation impossible : ' + errorMessage
+                'Activation impossible (module v3) : ' + errorMessage
             );
             publishState('error', null, errorMessage);
         }
