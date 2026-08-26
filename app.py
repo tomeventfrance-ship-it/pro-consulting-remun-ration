@@ -13,6 +13,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
 
 from utils import (
     calculate_consultant_rewards,
@@ -345,6 +346,31 @@ st.markdown(
         text-transform: uppercase;
     }
 
+    .pc-chat-message {
+        margin: 0.55rem 0;
+        padding: 0.85rem 1rem;
+        border: 1px solid rgba(115, 255, 240, 0.24);
+        border-radius: 14px;
+        background: linear-gradient(
+            145deg,
+            rgba(12, 54, 70, 0.94),
+            rgba(7, 29, 42, 0.88)
+        );
+    }
+
+    .pc-chat-meta {
+        margin-bottom: 0.35rem;
+        color: var(--pc-gold);
+        font-size: 0.78rem;
+        font-weight: 760;
+    }
+
+    .pc-chat-body {
+        color: var(--pc-cream);
+        line-height: 1.45;
+        overflow-wrap: anywhere;
+    }
+
     @media (max-width: 760px) {
         .block-container {
             padding: 1rem 0.85rem 3rem;
@@ -484,7 +510,7 @@ def reward_tracking_to_excel(dataframe):
 
         data_last_row = len(export_dataframe) + 1
         if len(export_dataframe):
-            worksheet.auto_filter.ref = f"A1:H{data_last_row}"
+            worksheet.auto_filter.ref = f"A1:I{data_last_row}"
             event_validation = DataValidation(
                 type="list",
                 formula1='"Live,Match"',
@@ -496,10 +522,10 @@ def reward_tracking_to_excel(dataframe):
             event_validation.add(f"C2:C{data_last_row}")
 
             for row_number in range(2, data_last_row + 1):
-                worksheet[f"G{row_number}"] = (
-                    f"=E{row_number}+F{row_number}"
+                worksheet[f"H{row_number}"] = (
+                    f"=F{row_number}+G{row_number}"
                 )
-                for column_letter in ("E", "F", "G"):
+                for column_letter in ("F", "G", "H"):
                     worksheet[f"{column_letter}{row_number}"].number_format = (
                         "#,##0"
                     )
@@ -515,7 +541,7 @@ def reward_tracking_to_excel(dataframe):
 
             total_row = data_last_row + 1
             worksheet[f"D{total_row}"] = "TOTAL GÉNÉRAL"
-            for column_letter in ("E", "F", "G"):
+            for column_letter in ("F", "G", "H"):
                 worksheet[f"{column_letter}{total_row}"] = (
                     f"=SUM({column_letter}2:{column_letter}{data_last_row})"
                 )
@@ -531,10 +557,11 @@ def reward_tracking_to_excel(dataframe):
             "B": 11,
             "C": 18,
             "D": 28,
-            "E": 25,
-            "F": 38,
-            "G": 23,
-            "H": 24,
+            "E": 24,
+            "F": 25,
+            "G": 38,
+            "H": 23,
+            "I": 24,
         }
         for column_letter, width in column_widths.items():
             worksheet.column_dimensions[column_letter].width = width
@@ -668,7 +695,7 @@ def get_database_url():
 
 @st.cache_resource(show_spinner=False)
 def initialize_settings_database(database_url):
-    """Crée la table de réglages persistants si elle n'existe pas."""
+    """Crée les tables persistantes nécessaires si elles n'existent pas."""
     with psycopg.connect(database_url) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -679,6 +706,27 @@ def initialize_settings_database(database_url):
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_by TEXT NOT NULL
                 )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pro_consulting_chat_messages (
+                    id BIGSERIAL PRIMARY KEY,
+                    channel TEXT NOT NULL DEFAULT 'general',
+                    author_email TEXT NOT NULL,
+                    author_name TEXT NOT NULL,
+                    author_role TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMPTZ NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                    pro_consulting_chat_active_messages_idx
+                ON pro_consulting_chat_messages (channel, expires_at)
                 """
             )
         connection.commit()
@@ -772,6 +820,11 @@ def director_management_scope():
     return "admin:director_management"
 
 
+def collaborator_access_scope():
+    """Accès ajoutés et gérés uniquement depuis le compte administrateur."""
+    return "admin:collaborator_access"
+
+
 def reward_tracking_scope():
     """Un registre actif unique est partagé par les cinq comptes."""
     return "shared:reward_tracking:current"
@@ -785,6 +838,114 @@ def legacy_reward_tracking_scope(month):
             "reward_tracking",
             safe_export_name(month),
         ]
+    )
+
+
+CHAT_RETENTION_HOURS = 48
+CHAT_MAX_MESSAGE_LENGTH = 2000
+
+
+def load_collective_chat_messages(database_url, limit=250):
+    """Charge uniquement les messages collectifs encore actifs."""
+    initialize_settings_database(database_url)
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    author_email,
+                    author_name,
+                    author_role,
+                    message,
+                    created_at,
+                    expires_at
+                FROM pro_consulting_chat_messages
+                WHERE channel = 'general'
+                  AND expires_at > CURRENT_TIMESTAMP
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (max(1, min(int(limit), 500)),),
+            )
+            rows = cursor.fetchall()
+
+    return [
+        {
+            "id": row[0],
+            "author_email": row[1],
+            "author_name": row[2],
+            "author_role": row[3],
+            "message": row[4],
+            "created_at": row[5],
+            "expires_at": row[6],
+        }
+        for row in reversed(rows)
+    ]
+
+
+def save_collective_chat_message(
+    database_url,
+    author_email,
+    author_name,
+    author_role,
+    message,
+):
+    """Enregistre un message collectif avec une expiration serveur à 48 h."""
+    cleaned_message = str(message or "").strip()
+    if not cleaned_message:
+        raise ValueError("Le message est vide.")
+    if len(cleaned_message) > CHAT_MAX_MESSAGE_LENGTH:
+        raise ValueError(
+            f"Le message dépasse {CHAT_MAX_MESSAGE_LENGTH} caractères."
+        )
+
+    initialize_settings_database(database_url)
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM pro_consulting_chat_messages
+                WHERE expires_at <= CURRENT_TIMESTAMP
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO pro_consulting_chat_messages (
+                    channel,
+                    author_email,
+                    author_name,
+                    author_role,
+                    message,
+                    expires_at
+                )
+                VALUES (
+                    'general',
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    CURRENT_TIMESTAMP + INTERVAL '48 hours'
+                )
+                """,
+                (
+                    normalize_email(author_email),
+                    str(author_name or "Utilisateur").strip(),
+                    str(author_role or "collaborator").strip(),
+                    cleaned_message,
+                ),
+            )
+        connection.commit()
+
+
+def format_chat_datetime(value):
+    """Affiche les horaires du chat dans le fuseau français."""
+    if not isinstance(value, datetime):
+        return ""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=ZoneInfo("UTC"))
+    return value.astimezone(ZoneInfo("Europe/Paris")).strftime(
+        "%d/%m/%Y à %H:%M"
     )
 
 
@@ -1033,6 +1194,7 @@ REWARD_TRACKING_COLUMNS = [
     "Heure",
     "Type d’événement",
     "Créateur",
+    "Groupe",
     "Récompense créateur",
     "Rémunération consultant / responsable",
     "Total récompense",
@@ -1089,6 +1251,7 @@ def clean_reward_tracking_rows(rows):
                 "Heure": clean_text(row.get("Heure", "")),
                 "Type d’événement": event_type,
                 "Créateur": creator,
+                "Groupe": clean_text(row.get("Groupe", "")),
                 "Récompense créateur": creator_reward,
                 "Rémunération consultant / responsable": hierarchy_reward,
                 "Total récompense": creator_reward + hierarchy_reward,
@@ -1119,6 +1282,9 @@ def build_reward_tracking_table(creator_results, saved_rows=None):
         saved_row = saved_candidates.pop(0) if saved_candidates else {}
         payment_mode = str(
             creator_row.get("Mode paiement", "Diamants") or "Diamants"
+        ).strip()
+        creator_group = str(
+            creator_row.get("Groupe", saved_row.get("Groupe", "")) or ""
         ).strip()
         if payment_mode == "Facture €":
             creator_reward = 0
@@ -1156,6 +1322,7 @@ def build_reward_tracking_table(creator_results, saved_rows=None):
                     "",
                 ),
                 "Créateur": creator,
+                "Groupe": creator_group,
                 "Récompense créateur": creator_reward,
                 "Rémunération consultant / responsable": hierarchy_reward,
                 "Total récompense": creator_reward + hierarchy_reward,
@@ -1184,6 +1351,8 @@ def merge_collective_reward_tracking_rows(
     baseline_rows,
     local_creators,
     can_update_sent_status=False,
+    editable_groups=None,
+    allow_new_rows=True,
 ):
     """Fusionne une sauvegarde sans effacer le travail d'un autre compte."""
     remote_rows = clean_reward_tracking_rows(remote_rows)
@@ -1205,6 +1374,13 @@ def merge_collective_reward_tracking_rows(
         for creator in local_creators
         if reward_creator_key(creator)
     }
+    editable_group_keys = None
+    if editable_groups is not None:
+        editable_group_keys = {
+            normalize_group_name(group)
+            for group in editable_groups
+            if normalize_group_name(group)
+        }
 
     ordered_keys = list(remote_by_creator)
     ordered_keys.extend(
@@ -1229,11 +1405,25 @@ def merge_collective_reward_tracking_rows(
             merged_rows.append(remote_row)
             continue
         if remote_row is None:
-            merged_rows.append(local_row)
+            if allow_new_rows:
+                merged_rows.append(local_row)
+            continue
+
+        row_is_editable = (
+            editable_group_keys is None
+            or normalize_group_name(remote_row.get("Groupe", ""))
+            in editable_group_keys
+        )
+        if not row_is_editable:
+            merged_rows.append(remote_row)
             continue
 
         merged_row = dict(remote_row)
         if creator_key in local_creator_keys:
+            merged_row["Groupe"] = local_row.get(
+                "Groupe",
+                remote_row.get("Groupe", ""),
+            )
             merged_row["Récompense créateur"] = local_row[
                 "Récompense créateur"
             ]
@@ -1329,6 +1519,7 @@ def reset_calculations():
         "reward_tracking_table",
         "reward_tracking_signature",
         "reward_tracking_editor",
+        "manager_reward_tracking_editor",
         "reward_tracking_loaded_scope",
         "reward_tracking_baseline_rows",
         "reward_tracking_active_month",
@@ -1721,7 +1912,7 @@ def show_financial_summary(dataframe):
     )
 
 
-AUTHORIZED_USERS = {
+BASE_AUTHORIZED_USERS = {
     "tomeventfrance@gmail.com": {
         "name": "Thomas",
         "role": "admin",
@@ -1748,6 +1939,130 @@ AUTHORIZED_USERS = {
         "direction": "Direction Vivi",
     },
 }
+
+COLLABORATOR_ROLE_LABELS = {
+    "director": "Directeur",
+    "performance_manager": "Responsable performance",
+}
+
+
+def clean_collaborator_access_records(rows, available_groups=None):
+    """Valide les accès créés par l'administrateur avant utilisation."""
+    rows = rows if isinstance(rows, list) else []
+    available_group_set = (
+        {str(group).strip() for group in available_groups}
+        if available_groups is not None
+        else None
+    )
+    cleaned = []
+    seen_emails = set(BASE_AUTHORIZED_USERS)
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        email = normalize_email(row.get("email"))
+        name = str(row.get("name") or "").strip()
+        role = str(row.get("role") or "").strip()
+        groups = row.get("groups", [])
+        groups = groups if isinstance(groups, list) else []
+        active = bool(row.get("active", True))
+
+        if (
+            not email
+            or not name
+            or role not in COLLABORATOR_ROLE_LABELS
+            or email in seen_emails
+        ):
+            continue
+
+        unique_groups = []
+        seen_groups = set()
+        for group in groups:
+            cleaned_group = str(group or "").strip()
+            group_key = normalize_group_name(cleaned_group)
+            if not cleaned_group or group_key in seen_groups:
+                continue
+            if (
+                available_group_set is not None
+                and cleaned_group not in available_group_set
+            ):
+                continue
+            seen_groups.add(group_key)
+            unique_groups.append(cleaned_group)
+
+        seen_emails.add(email)
+        cleaned.append(
+            {
+                "email": email,
+                "name": name,
+                "role": role,
+                "groups": unique_groups,
+                "active": active,
+            }
+        )
+
+    return cleaned
+
+
+def build_authorized_users(database_url):
+    """Réunit les comptes protégés et les collaborateurs actifs."""
+    authorized_users = {
+        email: dict(access)
+        for email, access in BASE_AUTHORIZED_USERS.items()
+    }
+    access_error = None
+
+    if not database_url:
+        return authorized_users, access_error
+
+    try:
+        initialize_settings_database(database_url)
+        director_payload = load_persistent_scope(
+            database_url,
+            director_management_scope(),
+        )
+        director_config = director_payload.get("directors", {})
+        if isinstance(director_config, dict):
+            for email, saved_row in director_config.items():
+                normalized_email = normalize_email(email)
+                if (
+                    normalized_email in authorized_users
+                    and isinstance(saved_row, dict)
+                ):
+                    authorized_users[normalized_email]["groups"] = list(
+                        saved_row.get("groups", [])
+                    )
+
+        collaborator_payload = load_persistent_scope(
+            database_url,
+            collaborator_access_scope(),
+        )
+        collaborator_rows = clean_collaborator_access_records(
+            collaborator_payload.get("collaborators", [])
+        )
+        for collaborator in collaborator_rows:
+            if not collaborator["active"]:
+                continue
+            role = collaborator["role"]
+            authorized_users[collaborator["email"]] = {
+                "name": collaborator["name"],
+                "role": role,
+                "direction": (
+                    f"Direction {collaborator['name']}"
+                    if role == "director"
+                    else f"Responsable performance • {collaborator['name']}"
+                ),
+                "groups": list(collaborator["groups"]),
+                "managed_access": True,
+            }
+    except Exception:
+        access_error = (
+            "La liste des collaborateurs ajoutés ne peut pas être chargée "
+            "pour le moment. Les comptes administrateur et directeurs "
+            "protégés restent accessibles."
+        )
+
+    return authorized_users, access_error
 
 DIRECTOR_MANAGEMENT_PROFILES = (
     {
@@ -1843,15 +2158,11 @@ def validate_director_import_groups(
             "unexpected_groups": [],
         }
 
-    profile = next(
-        (
-            item
-            for item in DIRECTOR_MANAGEMENT_PROFILES
-            if item["email"] == normalize_email(user_email)
-        ),
-        None,
+    normalized_user_email = normalize_email(user_email)
+    user_access = globals().get("AUTHORIZED_USERS", {}).get(
+        normalized_user_email
     )
-    if profile is None:
+    if not user_access or user_access.get("role") != "director":
         return {
             "valid": False,
             "error": "Aucune direction n’est associée à ce compte.",
@@ -1859,25 +2170,7 @@ def validate_director_import_groups(
             "unexpected_groups": [],
         }
 
-    try:
-        saved_payload = load_persistent_scope(
-            database_url,
-            director_management_scope(),
-        )
-    except Exception:
-        return {
-            "valid": False,
-            "error": (
-                "Les groupes autorisés ne peuvent pas être chargés. "
-                "L’import est bloqué par sécurité."
-            ),
-            "missing_groups": [],
-            "unexpected_groups": [],
-        }
-
-    saved_directors = saved_payload.get("directors", {})
-    saved_direction = saved_directors.get(profile["email"], {})
-    allowed_groups = saved_direction.get("groups", [])
+    allowed_groups = user_access.get("groups", [])
     allowed_groups = (
         allowed_groups if isinstance(allowed_groups, list) else []
     )
@@ -2005,6 +2298,10 @@ current_user_email = normalize_email(
     or user_claims.get("preferred_username")
     or user_claims.get("upn")
 )
+database_url = get_database_url()
+AUTHORIZED_USERS, collaborator_access_load_error = build_authorized_users(
+    database_url
+)
 current_user_access = AUTHORIZED_USERS.get(current_user_email)
 
 if current_user_access is None:
@@ -2024,6 +2321,7 @@ if current_user_access is None:
 current_user_role = current_user_access["role"]
 current_user_name = current_user_access["name"]
 current_user_direction = current_user_access["direction"]
+current_user_groups = list(current_user_access.get("groups", []))
 
 # Streamlit peut conserver la même session après une déconnexion. On efface
 # donc toutes les données propres à la branche lors d'un changement de compte.
@@ -2039,9 +2337,10 @@ if st.session_state.get("active_user_email") != current_user_email:
     st.session_state.pop("backstage_restore_error", None)
     st.session_state.pop("admin_director_management_loaded", None)
     st.session_state.pop("admin_director_management_config", None)
+    st.session_state.pop("admin_collaborator_access_loaded", None)
+    st.session_state.pop("admin_collaborator_access_rows", None)
     st.session_state.active_user_email = current_user_email
 
-database_url = get_database_url()
 persistent_settings_available = database_url is not None
 persistent_settings_error = None
 
@@ -2153,11 +2452,16 @@ st.sidebar.button(
     use_container_width=True,
 )
 
+if collaborator_access_load_error and current_user_role == "admin":
+    st.sidebar.warning(collaborator_access_load_error)
+
 admin_pages = [
     "🏠 Accueil",
+    "💬 Chat collectif",
     "📥 Import Backstage",
     "⚙️ Paramètres",
     "🛡️ Administration",
+    "🔐 Accès collaborateurs",
     "💎 Créateurs",
     "👥 Consultants",
     "📈 Responsables performance",
@@ -2168,6 +2472,7 @@ admin_pages = [
 
 director_pages = [
     "🏠 Accueil",
+    "💬 Chat collectif",
     "📥 Import Backstage",
     "⚙️ Paramètres",
     "🛡️ Administration",
@@ -2178,9 +2483,20 @@ director_pages = [
     "🏢 Directeur de branche",
 ]
 
+performance_manager_pages = [
+    "💬 Chat collectif",
+    "🎁 Suivi récompenses",
+]
+
+pages_by_role = {
+    "admin": admin_pages,
+    "director": director_pages,
+    "performance_manager": performance_manager_pages,
+}
+
 page = st.sidebar.radio(
     "Navigation",
-    admin_pages if current_user_role == "admin" else director_pages,
+    pages_by_role.get(current_user_role, []),
 )
 
 # Le suivi est partagé entre plusieurs sessions Streamlit. Lorsqu'un
@@ -2197,6 +2513,7 @@ if (
 ):
     st.session_state.pop("reward_tracking_loaded_scope", None)
     st.session_state.pop("reward_tracking_editor", None)
+    st.session_state.pop("manager_reward_tracking_editor", None)
 st.session_state.previous_navigation_page = page
 
 
@@ -2222,6 +2539,124 @@ if page == "🏠 Accueil":
         "Utilisez le menu de gauche pour importer l’export et calculer "
         "les rémunérations."
     )
+
+
+elif page == "💬 Chat collectif":
+    render_brand_hero(
+        "Chat collectif",
+        "Échangez entre l’administration, les directeurs et les "
+        "responsables performance. Chaque message disparaît "
+        "automatiquement après 48 heures.",
+        "PRO CONSULTING • ÉQUIPE",
+    )
+
+    if not persistent_settings_available:
+        st.error(
+            "Le chat collectif nécessite la connexion PostgreSQL. Aucun "
+            "message local ne sera accepté afin d’éviter une fausse "
+            "confirmation d’envoi."
+        )
+        if persistent_settings_error:
+            st.warning(persistent_settings_error)
+        st.stop()
+
+    st.caption(
+        "🔄 Actualisation automatique toutes les 10 secondes • "
+        "Conservation maximale : 48 heures"
+    )
+
+    fragment_decorator = (
+        st.fragment(run_every="10s")
+        if hasattr(st, "fragment")
+        else (lambda function: function)
+    )
+
+    @fragment_decorator
+    def render_collective_chat_messages():
+        try:
+            chat_messages = load_collective_chat_messages(database_url)
+        except Exception:
+            st.error(
+                "Les messages ne peuvent pas être chargés pour le moment."
+            )
+            return
+
+        if not chat_messages:
+            st.info(
+                "Aucun message actif. Le prochain message sera visible par "
+                "tous les collaborateurs autorisés."
+            )
+            return
+
+        for chat_message in chat_messages:
+            role_label = COLLABORATOR_ROLE_LABELS.get(
+                chat_message["author_role"],
+                "Administrateur"
+                if chat_message["author_role"] == "admin"
+                else chat_message["author_role"],
+            )
+            message_body = escape(
+                str(chat_message["message"] or "")
+            ).replace("\n", "<br>")
+            st.markdown(
+                f"""
+                <div class="pc-chat-message">
+                    <div class="pc-chat-meta">
+                        {escape(str(chat_message['author_name']))}
+                        • {escape(str(role_label))}
+                        • {escape(format_chat_datetime(chat_message['created_at']))}
+                    </div>
+                    <div class="pc-chat-body">{message_body}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    refresh_chat_column, identity_chat_column = st.columns([1, 3])
+    refresh_chat_column.button(
+        "🔄 Actualiser",
+        key="refresh_collective_chat",
+        use_container_width=True,
+    )
+    identity_chat_column.info(
+        f"Vous écrivez en tant que **{current_user_name}** — "
+        f"{current_user_direction}."
+    )
+    render_collective_chat_messages()
+
+    with st.form("collective_chat_form", clear_on_submit=True):
+        chat_message_text = st.text_area(
+            "Votre message",
+            max_chars=CHAT_MAX_MESSAGE_LENGTH,
+            height=100,
+            placeholder="Écrivez votre message à l’équipe…",
+        )
+        send_chat_message = st.form_submit_button(
+            "📨 Envoyer au chat collectif",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if send_chat_message:
+        if not str(chat_message_text or "").strip():
+            st.warning("Écrivez un message avant de l’envoyer.")
+        else:
+            try:
+                save_collective_chat_message(
+                    database_url=database_url,
+                    author_email=current_user_email,
+                    author_name=current_user_name,
+                    author_role=current_user_role,
+                    message=chat_message_text,
+                )
+                st.rerun()
+            except ValueError as error:
+                st.warning(str(error))
+            except Exception:
+                st.error(
+                    "Le message n’a pas été enregistré. Vous pouvez le "
+                    "copier puis réessayer sans perdre son contenu."
+                )
 
 
 elif page == "📥 Import Backstage":
@@ -2872,6 +3307,320 @@ elif page == "🛡️ Administration":
         st.info("Aucune adresse n’est actuellement exclue.")
 
 
+elif page == "🔐 Accès collaborateurs":
+    if current_user_role != "admin":
+        st.error("Cette page est réservée à l’administrateur.")
+        st.stop()
+
+    render_brand_hero(
+        "Accès collaborateurs",
+        "Ajoutez les comptes autorisés, choisissez leur rôle et attribuez "
+        "leurs groupes. Cette page et ses réglages restent invisibles pour "
+        "tous les autres utilisateurs.",
+        "PRO CONSULTING • ADMINISTRATION PRIVÉE",
+    )
+    st.info(
+        "Les quatre directeurs déjà enregistrés conservent leurs accès. "
+        "Utilisez cette page pour ajouter et gérer les nouveaux "
+        "collaborateurs, notamment les responsables performance."
+    )
+
+    access_notice = st.session_state.pop(
+        "admin_collaborator_access_notice",
+        None,
+    )
+    if access_notice:
+        notice_type, notice_message = access_notice
+        getattr(st, notice_type)(notice_message)
+
+    if not persistent_settings_available:
+        st.error(
+            "La base PostgreSQL doit être connectée pour gérer les accès. "
+            "Aucun accès temporaire ne peut être créé."
+        )
+        if persistent_settings_error:
+            st.warning(persistent_settings_error)
+        st.stop()
+
+    saved_access_payload = {}
+    saved_director_payload = {}
+    try:
+        saved_access_payload = load_persistent_scope(
+            database_url,
+            collaborator_access_scope(),
+        )
+        saved_director_payload = load_persistent_scope(
+            database_url,
+            director_management_scope(),
+        )
+    except Exception:
+        st.error(
+            "Les accès enregistrés ne peuvent pas être chargés. Aucune "
+            "modification n’est autorisée tant que la connexion n’est pas "
+            "rétablie."
+        )
+        st.stop()
+
+    existing_access_rows = clean_collaborator_access_records(
+        saved_access_payload.get("collaborators", [])
+    )
+    known_group_values = set()
+    if (
+        st.session_state.backstage_data is not None
+        and "Groupe" in st.session_state.backstage_data.columns
+    ):
+        known_group_values.update(
+            value
+            for value in st.session_state.backstage_data["Groupe"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .unique()
+            if value and value.casefold() != "nan"
+        )
+    saved_directors = saved_director_payload.get("directors", {})
+    if isinstance(saved_directors, dict):
+        for director_row in saved_directors.values():
+            if isinstance(director_row, dict):
+                known_group_values.update(
+                    str(group).strip()
+                    for group in director_row.get("groups", [])
+                    if str(group).strip()
+                )
+    for collaborator_row in existing_access_rows:
+        known_group_values.update(collaborator_row["groups"])
+    available_access_groups = sorted(
+        known_group_values,
+        key=lambda value: value.casefold(),
+    )
+
+    if not available_access_groups:
+        st.warning(
+            "Aucun groupe n’est encore disponible. Importez le fichier "
+            "Backstage administrateur ou enregistrez d’abord les groupes "
+            "des quatre directions."
+        )
+
+    st.subheader("Ajouter un collaborateur")
+    with st.form("add_collaborator_access_form", clear_on_submit=True):
+        add_name_column, add_email_column = st.columns(2)
+        new_collaborator_name = add_name_column.text_input(
+            "Nom affiché",
+            placeholder="Exemple : Marie",
+        )
+        new_collaborator_email = add_email_column.text_input(
+            "Adresse Google autorisée",
+            placeholder="nom@gmail.com",
+        )
+        add_role_column, add_groups_column = st.columns(2)
+        new_collaborator_role_label = add_role_column.selectbox(
+            "Rôle",
+            options=list(COLLABORATOR_ROLE_LABELS.values()),
+        )
+        new_collaborator_groups = add_groups_column.multiselect(
+            "Groupes attribués",
+            options=available_access_groups,
+            placeholder="Sélectionnez un ou plusieurs groupes",
+        )
+        add_collaborator = st.form_submit_button(
+            "➕ Autoriser ce collaborateur",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if add_collaborator:
+        normalized_new_email = normalize_email(new_collaborator_email)
+        role_by_label = {
+            label: role
+            for role, label in COLLABORATOR_ROLE_LABELS.items()
+        }
+        known_emails = set(BASE_AUTHORIZED_USERS)
+        known_emails.update(row["email"] for row in existing_access_rows)
+        validation_error = None
+        if not str(new_collaborator_name or "").strip():
+            validation_error = "Le nom du collaborateur est obligatoire."
+        elif not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized_new_email):
+            validation_error = "L’adresse e-mail indiquée n’est pas valide."
+        elif normalized_new_email in known_emails:
+            validation_error = "Cette adresse possède déjà un accès."
+        elif not new_collaborator_groups:
+            validation_error = "Attribuez au moins un groupe."
+
+        if validation_error:
+            st.warning(validation_error)
+        else:
+            updated_access_rows = existing_access_rows + [
+                {
+                    "email": normalized_new_email,
+                    "name": str(new_collaborator_name).strip(),
+                    "role": role_by_label[new_collaborator_role_label],
+                    "groups": list(new_collaborator_groups),
+                    "active": True,
+                }
+            ]
+            try:
+                save_persistent_scopes(
+                    database_url,
+                    {
+                        collaborator_access_scope(): {
+                            "collaborators": updated_access_rows,
+                            "saved_at": datetime.now().isoformat(
+                                timespec="seconds"
+                            ),
+                        }
+                    },
+                    current_user_email,
+                )
+                st.session_state.admin_collaborator_access_notice = (
+                    "success",
+                    "Le collaborateur est autorisé. Il peut maintenant se "
+                    "connecter avec cette adresse Google.",
+                )
+                st.rerun()
+            except Exception:
+                st.error(
+                    "L’accès n’a pas été enregistré. Le collaborateur "
+                    "reste bloqué par sécurité."
+                )
+
+    st.divider()
+    st.subheader("Collaborateurs ajoutés")
+    if not existing_access_rows:
+        st.caption(
+            "Aucun collaborateur supplémentaire n’a encore été ajouté."
+        )
+    else:
+        role_labels = list(COLLABORATOR_ROLE_LABELS.values())
+        edited_access_rows = []
+        for access_index, access_row in enumerate(existing_access_rows):
+            safe_access_key = safe_export_name(access_row["email"])
+            with st.expander(
+                f"{access_row['name']} — {access_row['email']}",
+                expanded=True,
+            ):
+                edit_name_column, edit_email_column = st.columns(2)
+                edited_name = edit_name_column.text_input(
+                    "Nom affiché",
+                    value=access_row["name"],
+                    key=f"collaborator_name_{safe_access_key}_{access_index}",
+                )
+                edit_email_column.text_input(
+                    "Adresse Google",
+                    value=access_row["email"],
+                    disabled=True,
+                    key=f"collaborator_email_{safe_access_key}_{access_index}",
+                )
+                edit_role_column, edit_groups_column = st.columns(2)
+                current_role_label = COLLABORATOR_ROLE_LABELS[
+                    access_row["role"]
+                ]
+                edited_role_label = edit_role_column.selectbox(
+                    "Rôle",
+                    options=role_labels,
+                    index=role_labels.index(current_role_label),
+                    key=f"collaborator_role_{safe_access_key}_{access_index}",
+                )
+                edited_groups = edit_groups_column.multiselect(
+                    "Groupes attribués",
+                    options=available_access_groups,
+                    default=[
+                        group
+                        for group in access_row["groups"]
+                        if group in available_access_groups
+                    ],
+                    key=f"collaborator_groups_{safe_access_key}_{access_index}",
+                )
+                edited_active = st.toggle(
+                    "Accès actif",
+                    value=bool(access_row["active"]),
+                    key=f"collaborator_active_{safe_access_key}_{access_index}",
+                    help=(
+                        "Désactivez cette option pour bloquer immédiatement "
+                        "la prochaine ouverture de l’application."
+                    ),
+                )
+            edited_access_rows.append(
+                {
+                    "email": access_row["email"],
+                    "name": str(edited_name or "").strip(),
+                    "role": {
+                        label: role
+                        for role, label in COLLABORATOR_ROLE_LABELS.items()
+                    }[edited_role_label],
+                    "groups": list(edited_groups),
+                    "active": bool(edited_active),
+                }
+            )
+
+        save_all_collaborator_access = st.button(
+            "💾 Enregistrer les rôles et les groupes",
+            key="save_all_collaborator_access",
+            type="primary",
+            use_container_width=True,
+        )
+        if save_all_collaborator_access:
+            invalid_rows = [
+                row
+                for row in edited_access_rows
+                if not row["name"] or (row["active"] and not row["groups"])
+            ]
+            if invalid_rows:
+                st.warning(
+                    "Chaque accès actif doit conserver un nom et au moins "
+                    "un groupe attribué."
+                )
+            else:
+                try:
+                    save_persistent_scopes(
+                        database_url,
+                        {
+                            collaborator_access_scope(): {
+                                "collaborators": edited_access_rows,
+                                "saved_at": datetime.now().isoformat(
+                                    timespec="seconds"
+                                ),
+                            }
+                        },
+                        current_user_email,
+                    )
+                    st.session_state.admin_collaborator_access_notice = (
+                        "success",
+                        "Les rôles, groupes et statuts ont été enregistrés "
+                        "définitivement.",
+                    )
+                    st.rerun()
+                except Exception:
+                    st.error(
+                        "La modification n’a pas été enregistrée. Les droits "
+                        "précédents sont conservés."
+                    )
+
+    st.divider()
+    st.subheader("Lien unique de connexion")
+    st.write(
+        "Tous les collaborateurs utilisent la même adresse Streamlit. "
+        "Copiez le lien ci-dessous et partagez-le uniquement avec les "
+        "personnes autorisées. Leur rôle sera reconnu automatiquement après "
+        "la connexion Google."
+    )
+    try:
+        unique_application_url = str(st.context.url or "").strip()
+    except (AttributeError, RuntimeError):
+        unique_application_url = ""
+    if unique_application_url:
+        st.code(unique_application_url, language=None)
+        st.link_button(
+            "🔗 Ouvrir le lien partagé",
+            unique_application_url,
+            use_container_width=True,
+        )
+    else:
+        st.caption(
+            "L’adresse sera affichée automatiquement lorsque cette version "
+            "sera ouverte depuis Streamlit."
+        )
+
+
 elif page == "💎 Créateurs":
     st.title("💎 Calcul des créateurs")
     show_estimation_notice()
@@ -3318,9 +4067,11 @@ elif page == "📈 Responsables performance":
 elif page == "🎁 Suivi récompenses":
     st.title("🎁 Suivi collectif des récompenses")
     st.info(
-        "Ce tableau est commun à l’administration et aux quatre directions. "
+        "Ce tableau est commun à l’administration, aux directions et aux "
+        "responsables performance autorisés. "
         "Les créateurs et leurs récompenses sont repris automatiquement ; "
-        "les champs de suivi restent modifiables par l’équipe. Un créateur "
+        "les responsables ne peuvent modifier que les créateurs de leurs "
+        "groupes. Un créateur "
         "payé en Facture € apparaît automatiquement à 0 💎 dans ce suivi."
     )
     tracking_reset_notice = st.session_state.pop(
@@ -3336,12 +4087,13 @@ elif page == "🎁 Suivi récompenses":
         use_container_width=True,
         help=(
             "Recharge immédiatement la dernière sauvegarde effectuée par "
-            "l'administration ou l'une des quatre directions."
+            "un collaborateur autorisé."
         ),
     )
     if refresh_tracking:
         st.session_state.pop("reward_tracking_loaded_scope", None)
         st.session_state.pop("reward_tracking_editor", None)
+        st.session_state.pop("manager_reward_tracking_editor", None)
         st.session_state.pop("reward_tracking_table", None)
         st.session_state.pop("reward_tracking_baseline_rows", None)
         st.session_state.pop("reward_tracking_active_month", None)
@@ -3357,7 +4109,7 @@ elif page == "🎁 Suivi récompenses":
         )
 
     creator_results_for_tracking = pd.DataFrame(
-        columns=["Pseudo", "Rémunération 💎"]
+        columns=["Pseudo", "Groupe", "Rémunération 💎"]
     )
     if st.session_state.backstage_data is not None:
         creator_signature = (
@@ -3451,6 +4203,7 @@ elif page == "🎁 Suivi récompenses":
         )
         st.session_state.reward_tracking_loaded_scope = tracking_scope
         st.session_state.pop("reward_tracking_editor", None)
+        st.session_state.pop("manager_reward_tracking_editor", None)
     else:
         st.session_state.reward_tracking_table = (
             build_reward_tracking_table(
@@ -3468,8 +4221,8 @@ elif page == "🎁 Suivi récompenses":
     )
     if persistent_settings_available:
         st.success(
-            "☁️ Registre collectif unique actif : toutes les directions "
-            "enregistrent désormais dans le même tableau."
+            "☁️ Registre collectif unique actif : tous les collaborateurs "
+            "autorisés utilisent le même tableau."
         )
     last_tracking_save = st.session_state.get(
         "reward_tracking_last_saved_at"
@@ -3498,25 +4251,7 @@ elif page == "🎁 Suivi récompenses":
         )
         st.stop()
 
-    disabled_tracking_columns = [
-        "Créateur",
-        "Récompense créateur",
-        "Total récompense",
-    ]
-    if current_user_role != "admin":
-        disabled_tracking_columns.append("Récompense envoyée")
-
-    styled_tracking_table = tracking_table.style.apply(
-        style_sent_reward_rows,
-        axis=1,
-    )
-    edited_tracking_table = st.data_editor(
-        styled_tracking_table,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        disabled=disabled_tracking_columns,
-        column_config={
+    tracking_column_config = {
             "Date": st.column_config.TextColumn(
                 "Date",
                 help="À compléter manuellement, par exemple 05/08/2026.",
@@ -3531,6 +4266,10 @@ elif page == "🎁 Suivi récompenses":
                 required=False,
             ),
             "Créateur": st.column_config.TextColumn("Créateur"),
+            "Groupe": st.column_config.TextColumn(
+                "Groupe",
+                help="Groupe utilisé pour sécuriser les droits de saisie.",
+            ),
             "Récompense créateur": st.column_config.NumberColumn(
                 "Récompense créateur",
                 min_value=0,
@@ -3561,14 +4300,107 @@ elif page == "🎁 Suivi récompenses":
                 ),
                 default=False,
             ),
-        },
-        key="reward_tracking_editor",
-        on_change=synchronize_reward_tracking_editor,
-    )
+        }
 
-    cleaned_tracking_rows = clean_reward_tracking_rows(
-        edited_tracking_table.to_dict("records")
-    )
+    rows_to_save = []
+    editable_groups_for_save = None
+    allow_new_tracking_rows = True
+
+    if current_user_role == "performance_manager":
+        st.subheader("Vue collective complète")
+        st.dataframe(
+            tracking_table.style.apply(style_sent_reward_rows, axis=1),
+            use_container_width=True,
+            hide_index=True,
+            column_config=tracking_column_config,
+        )
+
+        manager_group_keys = {
+            normalize_group_name(group)
+            for group in current_user_groups
+            if normalize_group_name(group)
+        }
+        st.subheader("Créateurs modifiables — mes groupes")
+        if current_user_groups:
+            st.caption("Groupes attribués : " + ", ".join(current_user_groups))
+        manager_editable_table = tracking_table[
+            tracking_table["Groupe"]
+            .map(normalize_group_name)
+            .isin(manager_group_keys)
+        ].copy().reset_index(drop=True)
+
+        if manager_editable_table.empty:
+            st.warning(
+                "Aucun créateur du suivi collectif ne correspond encore à "
+                "vos groupes. Demandez à l’administrateur de vérifier votre "
+                "affectation ou aux directions d’enregistrer le suivi avec "
+                "la colonne Groupe."
+            )
+            edited_manager_tracking_table = manager_editable_table
+        else:
+            edited_manager_tracking_table = st.data_editor(
+                manager_editable_table.style.apply(
+                    style_sent_reward_rows,
+                    axis=1,
+                ),
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                disabled=[
+                    "Créateur",
+                    "Groupe",
+                    "Récompense créateur",
+                    "Total récompense",
+                    "Récompense envoyée",
+                ],
+                column_config=tracking_column_config,
+                key="manager_reward_tracking_editor",
+            )
+
+        rows_to_save = clean_reward_tracking_rows(
+            edited_manager_tracking_table.to_dict("records")
+        )
+        manager_updates_by_creator = {
+            reward_creator_key(row["Créateur"]): row
+            for row in rows_to_save
+        }
+        cleaned_tracking_rows = []
+        for collective_row in clean_reward_tracking_rows(
+            tracking_table.to_dict("records")
+        ):
+            cleaned_tracking_rows.append(
+                manager_updates_by_creator.get(
+                    reward_creator_key(collective_row["Créateur"]),
+                    collective_row,
+                )
+            )
+        editable_groups_for_save = current_user_groups
+        allow_new_tracking_rows = False
+    else:
+        disabled_tracking_columns = [
+            "Créateur",
+            "Groupe",
+            "Récompense créateur",
+            "Total récompense",
+        ]
+        if current_user_role != "admin":
+            disabled_tracking_columns.append("Récompense envoyée")
+
+        edited_tracking_table = st.data_editor(
+            tracking_table.style.apply(style_sent_reward_rows, axis=1),
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            disabled=disabled_tracking_columns,
+            column_config=tracking_column_config,
+            key="reward_tracking_editor",
+            on_change=synchronize_reward_tracking_editor,
+        )
+        cleaned_tracking_rows = clean_reward_tracking_rows(
+            edited_tracking_table.to_dict("records")
+        )
+        rows_to_save = cleaned_tracking_rows
+
     cleaned_tracking_table = pd.DataFrame(
         cleaned_tracking_rows,
         columns=REWARD_TRACKING_COLUMNS,
@@ -3604,7 +4436,13 @@ elif page == "🎁 Suivi récompenses":
         key="save_collective_reward_tracking",
         type="primary",
         use_container_width=True,
-        disabled=not persistent_settings_available,
+        disabled=(
+            not persistent_settings_available
+            or (
+                current_user_role == "performance_manager"
+                and not rows_to_save
+            )
+        ),
     ):
         if persistent_settings_available:
             try:
@@ -3623,7 +4461,7 @@ elif page == "🎁 Suivi récompenses":
                 merged_tracking_rows = (
                     merge_collective_reward_tracking_rows(
                         remote_rows=latest_tracking_payload.get("rows", []),
-                        local_rows=cleaned_tracking_rows,
+                        local_rows=rows_to_save,
                         baseline_rows=st.session_state.get(
                             "reward_tracking_baseline_rows",
                             [],
@@ -3632,6 +4470,8 @@ elif page == "🎁 Suivi récompenses":
                         can_update_sent_status=(
                             current_user_role == "admin"
                         ),
+                        editable_groups=editable_groups_for_save,
+                        allow_new_rows=allow_new_tracking_rows,
                     )
                 )
                 saved_at = datetime.now().isoformat(timespec="seconds")
@@ -3668,7 +4508,7 @@ elif page == "🎁 Suivi récompenses":
                 )
                 st.success(
                     "Le suivi collectif est enregistré et fusionné avec les "
-                    "dernières saisies des autres directions."
+                    "dernières saisies des autres collaborateurs."
                 )
             except Exception:
                 st.error(
@@ -3702,93 +4542,98 @@ elif page == "🎁 Suivi récompenses":
         "fichier .xlsx peut être importé directement dans Google Sheets."
     )
 
-    tracking_delete_generation = int(
-        st.session_state.get("reward_tracking_delete_generation", 0)
-    )
-    tracking_month_key = safe_export_name(active_tracking_month)
-    with st.expander(
-        f"🗑️ Réinitialiser le suivi collectif — {active_tracking_month}"
-    ):
-        st.warning(
-            "Cette suppression est collective : les informations manuelles "
-            "de ce mois seront effacées pour l’administration et les quatre "
-            "directions. Les récompenses automatiques seront recalculées à "
-            "partir du fichier Backstage actuellement chargé."
+    if current_user_role in {"admin", "director"}:
+        tracking_delete_generation = int(
+            st.session_state.get("reward_tracking_delete_generation", 0)
         )
-        confirm_tracking_deletion = st.checkbox(
-            "Je confirme la réinitialisation du suivi collectif de ce mois.",
-            key=(
-                "confirm_reward_tracking_deletion_"
-                f"{tracking_month_key}_{tracking_delete_generation}"
-            ),
-        )
-        if st.button(
-            "Réinitialiser définitivement ce mois",
-            key=(
-                "delete_reward_tracking_"
-                f"{tracking_month_key}_{tracking_delete_generation}"
-            ),
-            disabled=not confirm_tracking_deletion,
-            use_container_width=True,
+        tracking_month_key = safe_export_name(active_tracking_month)
+        with st.expander(
+            f"🗑️ Réinitialiser le suivi collectif — {active_tracking_month}"
         ):
-            if persistent_settings_available:
-                try:
-                    reset_saved_at = datetime.now().isoformat(
-                        timespec="seconds"
-                    )
-                    save_persistent_scopes(
-                        database_url,
-                        {
-                            tracking_scope: {
-                                "month": st.session_state.month,
-                                "rows": [],
-                                "saved_at": reset_saved_at,
-                                "saved_by": current_user_email,
-                            }
-                        },
-                        current_user_email,
-                    )
-                    st.session_state.pop(
-                        "reward_tracking_loaded_scope",
-                        None,
-                    )
-                    st.session_state.pop("reward_tracking_editor", None)
-                    st.session_state.pop("reward_tracking_table", None)
-                    st.session_state.pop(
-                        "reward_tracking_baseline_rows",
-                        None,
-                    )
-                    st.session_state.pop(
-                        "reward_tracking_active_month",
-                        None,
-                    )
-                    st.session_state.pop(
-                        "reward_tracking_last_saved_at",
-                        None,
-                    )
-                    st.session_state.pop(
-                        "reward_tracking_last_saved_by",
-                        None,
-                    )
-                    st.session_state.reward_tracking_delete_generation = (
-                        tracking_delete_generation + 1
-                    )
-                    st.session_state.reward_tracking_reset_notice = (
-                        "Le suivi collectif du mois a été réinitialisé."
-                    )
-                    st.rerun()
-                except Exception:
+            st.warning(
+                "Cette suppression est collective : les informations "
+                "manuelles de ce mois seront effacées pour tous. Les "
+                "récompenses automatiques seront recalculées à partir du "
+                "fichier Backstage actuellement chargé."
+            )
+            confirm_tracking_deletion = st.checkbox(
+                "Je confirme la réinitialisation du suivi collectif de ce mois.",
+                key=(
+                    "confirm_reward_tracking_deletion_"
+                    f"{tracking_month_key}_{tracking_delete_generation}"
+                ),
+            )
+            if st.button(
+                "Réinitialiser définitivement ce mois",
+                key=(
+                    "delete_reward_tracking_"
+                    f"{tracking_month_key}_{tracking_delete_generation}"
+                ),
+                disabled=not confirm_tracking_deletion,
+                use_container_width=True,
+            ):
+                if persistent_settings_available:
+                    try:
+                        reset_saved_at = datetime.now().isoformat(
+                            timespec="seconds"
+                        )
+                        save_persistent_scopes(
+                            database_url,
+                            {
+                                tracking_scope: {
+                                    "month": st.session_state.month,
+                                    "rows": [],
+                                    "saved_at": reset_saved_at,
+                                    "saved_by": current_user_email,
+                                }
+                            },
+                            current_user_email,
+                        )
+                        st.session_state.pop(
+                            "reward_tracking_loaded_scope",
+                            None,
+                        )
+                        st.session_state.pop("reward_tracking_editor", None)
+                        st.session_state.pop(
+                            "manager_reward_tracking_editor",
+                            None,
+                        )
+                        st.session_state.pop("reward_tracking_table", None)
+                        st.session_state.pop(
+                            "reward_tracking_baseline_rows",
+                            None,
+                        )
+                        st.session_state.pop(
+                            "reward_tracking_active_month",
+                            None,
+                        )
+                        st.session_state.pop(
+                            "reward_tracking_last_saved_at",
+                            None,
+                        )
+                        st.session_state.pop(
+                            "reward_tracking_last_saved_by",
+                            None,
+                        )
+                        st.session_state.reward_tracking_delete_generation = (
+                            tracking_delete_generation + 1
+                        )
+                        st.session_state.reward_tracking_reset_notice = (
+                            "Le suivi collectif du mois a été réinitialisé."
+                        )
+                        st.rerun()
+                    except Exception:
+                        st.error(
+                            "La réinitialisation a échoué. Les informations "
+                            "enregistrées ont été conservées."
+                        )
+                elif persistent_settings_error:
+                    st.error(persistent_settings_error)
+                else:
                     st.error(
-                        "La réinitialisation a échoué. Les informations "
-                        "enregistrées ont été conservées."
+                        "La base PostgreSQL n’est pas configurée : aucune "
+                        "suppression collective permanente n’est possible."
                     )
-            elif persistent_settings_error:
-                st.error(persistent_settings_error)
-            else:
-                st.error(
-                    "La base PostgreSQL n’est pas configurée : aucune "
-                    "suppression collective permanente n’est possible."
-                )
 
 
 elif page == "🏢 Directeur de branche":
