@@ -3,12 +3,11 @@ import json
 import hashlib
 import re
 import unicodedata
-from pathlib import Path
 
 import pandas as pd
 import psycopg
 import streamlit as st
-from streamlit.components.v1 import declare_component
+from streamlit import runtime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -922,23 +921,105 @@ def legacy_reward_tracking_scope(month):
 CHAT_RETENTION_HOURS = 48
 CHAT_MAX_MESSAGE_LENGTH = 2000
 WEB_PUSH_KEYS_SCOPE = "system:web_push_keys:v1"
-CHAT_PUSH_FRONTEND_VERSION = "v3_20260826"
+CHAT_PUSH_FRONTEND_VERSION = "v4_20260826"
 
 
-CHAT_PUSH_ASSETS_DIRECTORY = Path(__file__).parent / "chat_push_assets"
-chat_push_assets_component = declare_component(
-    f"chat_push_assets_{CHAT_PUSH_FRONTEND_VERSION}",
-    path=str(CHAT_PUSH_ASSETS_DIRECTORY),
-)
+CHAT_PUSH_SERVICE_WORKER_JS = r"""
+self.addEventListener("push", (event) => {
+    let payload = {};
+    try {
+        payload = event.data ? event.data.json() : {};
+    } catch (error) {
+        payload = {
+            title: "Nouveau message Pro Consulting",
+            body: event.data ? event.data.text() : "Ouvrez le chat collectif.",
+        };
+    }
+
+    const notificationTitle = payload.title || "Nouveau message Pro Consulting";
+    const notificationOptions = {
+        body: payload.body || "Ouvrez le chat collectif.",
+        data: {
+            url: payload.url || "/?page=chat",
+        },
+        tag: payload.tag || "pro-consulting-chat",
+        renotify: true,
+        vibrate: [180, 80, 180],
+    };
+
+    event.waitUntil(
+        self.registration.showNotification(
+            notificationTitle,
+            notificationOptions,
+        ),
+    );
+});
+
+self.addEventListener("notificationclick", (event) => {
+    event.notification.close();
+    const targetUrl = new URL(
+        event.notification.data?.url || "/?page=chat",
+        self.location.origin,
+    ).href;
+
+    event.waitUntil(
+        self.clients
+            .matchAll({ type: "window", includeUncontrolled: true })
+            .then(async (clientList) => {
+                for (const client of clientList) {
+                    if ("navigate" in client) {
+                        await client.navigate(targetUrl);
+                    }
+                    if ("focus" in client) {
+                        return client.focus();
+                    }
+                }
+                if (self.clients.openWindow) {
+                    return self.clients.openWindow(targetUrl);
+                }
+                return undefined;
+            }),
+    );
+});
+"""
 
 
-def chat_push_asset_url(filename):
-    """Retourne l’URL publique d’un fichier du composant Web Push."""
-    safe_filename = str(filename or "").strip().lstrip("/")
-    return (
-        f"component/{chat_push_assets_component.name}/"
-        f"{safe_filename}"
+CHAT_PUSH_MANIFEST_JSON = """
+{
+  "name": "Pro Consulting",
+  "short_name": "Pro Consulting",
+  "description": "Pilotage et chat collectif Pro Consulting",
+  "start_url": "/?page=chat",
+  "display": "standalone",
+  "background_color": "#071927",
+  "theme_color": "#007c86"
+}
+"""
+
+
+def register_chat_push_assets():
+    """Publie les fichiers Web Push via les routes média de Streamlit."""
+    if not runtime.exists():
+        return "", ""
+    media_manager = runtime.get_instance().media_file_mgr
+    worker_url = media_manager.add(
+        CHAT_PUSH_SERVICE_WORKER_JS.encode("utf-8"),
+        "text/javascript",
+        "chat.push.worker.v4",
+        file_name="chat-push-sw.js",
     )
+    manifest_url = media_manager.add(
+        CHAT_PUSH_MANIFEST_JSON.encode("utf-8"),
+        "application/manifest+json",
+        "chat.push.manifest.v4",
+        file_name="manifest.webmanifest",
+    )
+    return worker_url.lstrip("/"), manifest_url.lstrip("/")
+
+
+CHAT_PUSH_WORKER_URL, CHAT_PUSH_MANIFEST_URL = (
+    register_chat_push_assets()
+)
 
 
 CHAT_PUSH_COMPONENT_HTML = """
@@ -1141,7 +1222,7 @@ export default function(component) {
             button.textContent = '🔔 Réessayer l’activation';
             const errorMessage = error?.message || String(error);
             setStatus(
-                'Activation impossible (module v3) : ' + errorMessage
+                'Activation impossible (module v4) : ' + errorMessage
             );
             publishState('error', null, errorMessage);
         }
@@ -3334,12 +3415,8 @@ elif page == "💬 Chat collectif":
             push_component_result = chat_push_component(
                 data={
                     "public_key": web_push_keys["public_key"],
-                    "worker_url": chat_push_asset_url(
-                        "chat-push-sw.js"
-                    ),
-                    "manifest_url": chat_push_asset_url(
-                        "manifest.webmanifest"
-                    ),
+                    "worker_url": CHAT_PUSH_WORKER_URL,
+                    "manifest_url": CHAT_PUSH_MANIFEST_URL,
                 },
                 key=(
                     f"chat_push_{CHAT_PUSH_FRONTEND_VERSION}_"
