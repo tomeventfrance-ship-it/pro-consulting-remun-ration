@@ -520,7 +520,7 @@ def reward_tracking_to_excel(dataframe):
             event_validation.error = "Choisissez Live ou Match."
             event_validation.errorTitle = "Type d’événement incorrect"
             worksheet.add_data_validation(event_validation)
-            event_validation.add(f"G2:G{data_last_row}")
+            event_validation.add(f"C2:C{data_last_row}")
 
             for row_number in range(2, data_last_row + 1):
                 worksheet[f"J{row_number}"] = (
@@ -566,12 +566,12 @@ def reward_tracking_to_excel(dataframe):
 
         column_widths = {
             "A": 14,
-            "B": 14,
-            "C": 28,
-            "D": 24,
-            "E": 14,
-            "F": 11,
-            "G": 18,
+            "B": 11,
+            "C": 18,
+            "D": 10,
+            "E": 10,
+            "F": 28,
+            "G": 24,
             "H": 25,
             "I": 38,
             "J": 23,
@@ -1203,13 +1203,13 @@ def clean_exclusions(rows):
 
 
 REWARD_TRACKING_COLUMNS = [
+    "Date",
+    "Heure",
+    "Type d’événement",
     "Récompense validée",
     "Récompense refusée",
     "Créateur",
     "Groupe",
-    "Date",
-    "Heure",
-    "Type d’événement",
     "Récompense créateur",
     "Rémunération consultant / responsable",
     "Total récompense",
@@ -1273,13 +1273,13 @@ def clean_reward_tracking_rows(rows):
             reward_is_refused = False
         cleaned_rows.append(
             {
+                "Date": clean_text(row.get("Date", "")),
+                "Heure": clean_text(row.get("Heure", "")),
+                "Type d’événement": event_type,
                 "Récompense validée": reward_is_validated,
                 "Récompense refusée": reward_is_refused,
                 "Créateur": creator,
                 "Groupe": clean_text(row.get("Groupe", "")),
-                "Date": clean_text(row.get("Date", "")),
-                "Heure": clean_text(row.get("Heure", "")),
-                "Type d’événement": event_type,
                 "Récompense créateur": creator_reward,
                 "Rémunération consultant / responsable": hierarchy_reward,
                 "Total récompense": creator_reward + hierarchy_reward,
@@ -1340,6 +1340,12 @@ def build_reward_tracking_table(creator_results, saved_rows=None):
 
         tracking_rows.append(
             {
+                "Date": saved_row.get("Date", ""),
+                "Heure": saved_row.get("Heure", ""),
+                "Type d’événement": saved_row.get(
+                    "Type d’événement",
+                    "",
+                ),
                 "Récompense validée": bool(
                     saved_row.get("Récompense validée", False)
                 ),
@@ -1348,12 +1354,6 @@ def build_reward_tracking_table(creator_results, saved_rows=None):
                 ),
                 "Créateur": creator,
                 "Groupe": creator_group,
-                "Date": saved_row.get("Date", ""),
-                "Heure": saved_row.get("Heure", ""),
-                "Type d’événement": saved_row.get(
-                    "Type d’événement",
-                    "",
-                ),
                 "Récompense créateur": creator_reward,
                 "Rémunération consultant / responsable": hierarchy_reward,
                 "Total récompense": creator_reward + hierarchy_reward,
@@ -4436,6 +4436,7 @@ elif page == "🎁 Suivi récompenses":
             ),
             "Récompense validée": st.column_config.CheckboxColumn(
                 "✅ Validée",
+                width="small",
                 help=(
                     "Seul FONDATEUR ADMIN peut confirmer l’envoi. La ligne "
                     "devient verte."
@@ -4444,6 +4445,7 @@ elif page == "🎁 Suivi récompenses":
             ),
             "Récompense refusée": st.column_config.CheckboxColumn(
                 "⛔ Refusée",
+                width="small",
                 help=(
                     "Seul FONDATEUR ADMIN peut refuser la récompense. La "
                     "ligne devient rouge."
