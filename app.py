@@ -3,10 +3,12 @@ import json
 import hashlib
 import re
 import unicodedata
+from pathlib import Path
 
 import pandas as pd
 import psycopg
 import streamlit as st
+from streamlit.components.v1 import declare_component
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -922,6 +924,22 @@ CHAT_MAX_MESSAGE_LENGTH = 2000
 WEB_PUSH_KEYS_SCOPE = "system:web_push_keys:v1"
 
 
+CHAT_PUSH_ASSETS_DIRECTORY = Path(__file__).parent / "chat_push_assets"
+chat_push_assets_component = declare_component(
+    "chat_push_assets",
+    path=str(CHAT_PUSH_ASSETS_DIRECTORY),
+)
+
+
+def chat_push_asset_url(filename):
+    """Retourne l’URL publique d’un fichier du composant Web Push."""
+    safe_filename = str(filename or "").strip().lstrip("/")
+    return (
+        f"/component/{chat_push_assets_component.name}/"
+        f"{safe_filename}"
+    )
+
+
 CHAT_PUSH_COMPONENT_HTML = """
 <div class="pc-push-control">
     <button type="button" data-pc-push-button>
@@ -973,6 +991,8 @@ export default function(component) {
     const button = parentElement.querySelector('[data-pc-push-button]');
     const status = parentElement.querySelector('[data-pc-push-status]');
     const publicKey = data.public_key;
+    const workerUrl = new URL(data.worker_url, window.location.origin);
+    const workerScope = new URL('./', workerUrl).pathname;
 
     const publishState = (permission, subscription, message) => {
         setStateValue('push_state', JSON.stringify({
@@ -1000,19 +1020,19 @@ export default function(component) {
         if (document.querySelector('link[data-pc-chat-manifest]')) return;
         const manifest = document.createElement('link');
         manifest.rel = 'manifest';
-        manifest.href = '/app/static/manifest.webmanifest';
+        manifest.href = data.manifest_url;
         manifest.dataset.pcChatManifest = 'true';
         document.head.appendChild(manifest);
     };
 
     const getRegistration = async () => {
         let registration = await navigator.serviceWorker.getRegistration(
-            '/app/static/'
+            workerScope
         );
         if (!registration) {
             registration = await navigator.serviceWorker.register(
-                '/app/static/chat-push-sw.js',
-                { scope: '/app/static/' }
+                workerUrl.href,
+                { scope: workerScope }
             );
         }
         return registration;
@@ -1039,7 +1059,7 @@ export default function(component) {
         }
 
         const registration = await navigator.serviceWorker.getRegistration(
-            '/app/static/'
+            workerScope
         );
         const subscription = registration
             ? await registration.pushManager.getSubscription()
@@ -1115,10 +1135,11 @@ export default function(component) {
             );
         } catch (error) {
             button.textContent = '🔔 Réessayer l’activation';
+            const errorMessage = error?.message || String(error);
             setStatus(
-                'L’activation a échoué sur ce téléphone. Vous pouvez réessayer.'
+                'Activation impossible : ' + errorMessage
             );
-            publishState('error', null, String(error));
+            publishState('error', null, errorMessage);
         }
     };
 
@@ -3307,7 +3328,15 @@ elif page == "💬 Chat collectif":
                 "navigateur. Aucun collaborateur n’est obligé de l’accepter."
             )
             push_component_result = chat_push_component(
-                data={"public_key": web_push_keys["public_key"]},
+                data={
+                    "public_key": web_push_keys["public_key"],
+                    "worker_url": chat_push_asset_url(
+                        "chat-push-sw.js"
+                    ),
+                    "manifest_url": chat_push_asset_url(
+                        "manifest.webmanifest"
+                    ),
+                },
                 key=f"chat_push_{safe_export_name(current_user_email)}",
                 on_push_state_change=lambda: None,
             )
