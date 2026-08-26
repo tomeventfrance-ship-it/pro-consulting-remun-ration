@@ -922,11 +922,12 @@ def legacy_reward_tracking_scope(month):
 CHAT_RETENTION_HOURS = 48
 CHAT_MAX_MESSAGE_LENGTH = 2000
 WEB_PUSH_KEYS_SCOPE = "system:web_push_keys:v1"
+CHAT_PUSH_FRONTEND_VERSION = "v2_20260826"
 
 
 CHAT_PUSH_ASSETS_DIRECTORY = Path(__file__).parent / "chat_push_assets"
 chat_push_assets_component = declare_component(
-    "chat_push_assets",
+    f"chat_push_assets_{CHAT_PUSH_FRONTEND_VERSION}",
     path=str(CHAT_PUSH_ASSETS_DIRECTORY),
 )
 
@@ -1156,7 +1157,7 @@ export default function(component) {
 
 
 chat_push_component = st.components.v2.component(
-    "pro_consulting_chat_push",
+    f"pro_consulting_chat_push_{CHAT_PUSH_FRONTEND_VERSION}",
     html=CHAT_PUSH_COMPONENT_HTML,
     css=CHAT_PUSH_COMPONENT_CSS,
     js=CHAT_PUSH_COMPONENT_JS,
@@ -3337,7 +3338,10 @@ elif page == "💬 Chat collectif":
                         "manifest.webmanifest"
                     ),
                 },
-                key=f"chat_push_{safe_export_name(current_user_email)}",
+                key=(
+                    f"chat_push_{CHAT_PUSH_FRONTEND_VERSION}_"
+                    f"{safe_export_name(current_user_email)}"
+                ),
                 on_push_state_change=lambda: None,
             )
             push_state_value = getattr(
