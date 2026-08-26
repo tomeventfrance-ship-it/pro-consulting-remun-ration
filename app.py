@@ -498,6 +498,7 @@ def reward_tracking_to_excel(dataframe):
         header_fill = PatternFill("solid", fgColor="007C86")
         total_fill = PatternFill("solid", fgColor="FFC857")
         sent_fill = PatternFill("solid", fgColor="B7F7D0")
+        refused_fill = PatternFill("solid", fgColor="F4B7B7")
         for cell in worksheet[1]:
             cell.fill = header_fill
             cell.font = Font(color="FFFFFF", bold=True)
@@ -510,7 +511,7 @@ def reward_tracking_to_excel(dataframe):
 
         data_last_row = len(export_dataframe) + 1
         if len(export_dataframe):
-            worksheet.auto_filter.ref = f"A1:I{data_last_row}"
+            worksheet.auto_filter.ref = f"A1:J{data_last_row}"
             event_validation = DataValidation(
                 type="list",
                 formula1='"Live,Match"',
@@ -519,29 +520,40 @@ def reward_tracking_to_excel(dataframe):
             event_validation.error = "Choisissez Live ou Match."
             event_validation.errorTitle = "Type d’événement incorrect"
             worksheet.add_data_validation(event_validation)
-            event_validation.add(f"C2:C{data_last_row}")
+            event_validation.add(f"G2:G{data_last_row}")
 
             for row_number in range(2, data_last_row + 1):
-                worksheet[f"H{row_number}"] = (
-                    f"=F{row_number}+G{row_number}"
+                worksheet[f"J{row_number}"] = (
+                    f"=H{row_number}+I{row_number}"
                 )
-                for column_letter in ("F", "G", "H"):
+                for column_letter in ("H", "I", "J"):
                     worksheet[f"{column_letter}{row_number}"].number_format = (
                         "#,##0"
                     )
-                if bool(
+                reward_is_refused = bool(
                     export_dataframe.iloc[row_number - 2].get(
-                        "Récompense envoyée",
+                        "Récompense refusée",
                         False,
                     )
-                ):
+                )
+                reward_is_validated = bool(
+                    export_dataframe.iloc[row_number - 2].get(
+                        "Récompense validée",
+                        False,
+                    )
+                )
+                if reward_is_refused:
+                    for cell in worksheet[row_number]:
+                        cell.fill = refused_fill
+                        cell.font = Font(color="6B0F1A", bold=True)
+                elif reward_is_validated:
                     for cell in worksheet[row_number]:
                         cell.fill = sent_fill
                         cell.font = Font(color="073B24", bold=True)
 
             total_row = data_last_row + 1
-            worksheet[f"D{total_row}"] = "TOTAL GÉNÉRAL"
-            for column_letter in ("F", "G", "H"):
+            worksheet[f"G{total_row}"] = "TOTAL GÉNÉRAL"
+            for column_letter in ("H", "I", "J"):
                 worksheet[f"{column_letter}{total_row}"] = (
                     f"=SUM({column_letter}2:{column_letter}{data_last_row})"
                 )
@@ -554,14 +566,15 @@ def reward_tracking_to_excel(dataframe):
 
         column_widths = {
             "A": 14,
-            "B": 11,
-            "C": 18,
-            "D": 28,
-            "E": 24,
-            "F": 25,
-            "G": 38,
-            "H": 23,
-            "I": 24,
+            "B": 14,
+            "C": 28,
+            "D": 24,
+            "E": 14,
+            "F": 11,
+            "G": 18,
+            "H": 25,
+            "I": 38,
+            "J": 23,
         }
         for column_letter, width in column_widths.items():
             worksheet.column_dimensions[column_letter].width = width
@@ -816,7 +829,7 @@ def backstage_import_scope(user_email):
 
 
 def director_management_scope():
-    """Configuration privée des quatre directions, gérée par Thomas."""
+    """Configuration privée des quatre directions, gérée par le fondateur."""
     return "admin:director_management"
 
 
@@ -1190,15 +1203,16 @@ def clean_exclusions(rows):
 
 
 REWARD_TRACKING_COLUMNS = [
+    "Récompense validée",
+    "Récompense refusée",
+    "Créateur",
+    "Groupe",
     "Date",
     "Heure",
     "Type d’événement",
-    "Créateur",
-    "Groupe",
     "Récompense créateur",
     "Rémunération consultant / responsable",
     "Total récompense",
-    "Récompense envoyée",
 ]
 
 
@@ -1245,19 +1259,30 @@ def clean_reward_tracking_rows(rows):
         hierarchy_reward = clean_reward(
             row.get("Rémunération consultant / responsable", 0)
         )
+        reward_is_validated = clean_checkbox(
+            row.get(
+                "Récompense validée",
+                row.get("Récompense envoyée", False),
+            )
+        )
+        reward_is_refused = clean_checkbox(
+            row.get("Récompense refusée", False)
+        )
+        if reward_is_validated and reward_is_refused:
+            reward_is_validated = False
+            reward_is_refused = False
         cleaned_rows.append(
             {
+                "Récompense validée": reward_is_validated,
+                "Récompense refusée": reward_is_refused,
+                "Créateur": creator,
+                "Groupe": clean_text(row.get("Groupe", "")),
                 "Date": clean_text(row.get("Date", "")),
                 "Heure": clean_text(row.get("Heure", "")),
                 "Type d’événement": event_type,
-                "Créateur": creator,
-                "Groupe": clean_text(row.get("Groupe", "")),
                 "Récompense créateur": creator_reward,
                 "Rémunération consultant / responsable": hierarchy_reward,
                 "Total récompense": creator_reward + hierarchy_reward,
-                "Récompense envoyée": clean_checkbox(
-                    row.get("Récompense envoyée", False)
-                ),
             }
         )
 
@@ -1315,20 +1340,23 @@ def build_reward_tracking_table(creator_results, saved_rows=None):
 
         tracking_rows.append(
             {
+                "Récompense validée": bool(
+                    saved_row.get("Récompense validée", False)
+                ),
+                "Récompense refusée": bool(
+                    saved_row.get("Récompense refusée", False)
+                ),
+                "Créateur": creator,
+                "Groupe": creator_group,
                 "Date": saved_row.get("Date", ""),
                 "Heure": saved_row.get("Heure", ""),
                 "Type d’événement": saved_row.get(
                     "Type d’événement",
                     "",
                 ),
-                "Créateur": creator,
-                "Groupe": creator_group,
                 "Récompense créateur": creator_reward,
                 "Rémunération consultant / responsable": hierarchy_reward,
                 "Total récompense": creator_reward + hierarchy_reward,
-                "Récompense envoyée": bool(
-                    saved_row.get("Récompense envoyée", False)
-                ),
             }
         )
 
@@ -1350,7 +1378,7 @@ def merge_collective_reward_tracking_rows(
     local_rows,
     baseline_rows,
     local_creators,
-    can_update_sent_status=False,
+    can_update_reward_status=False,
     editable_groups=None,
     allow_new_rows=True,
 ):
@@ -1392,8 +1420,11 @@ def merge_collective_reward_tracking_rows(
         "Type d’événement",
         "Rémunération consultant / responsable",
     )
-    if can_update_sent_status:
-        manual_columns += ("Récompense envoyée",)
+    if can_update_reward_status:
+        manual_columns += (
+            "Récompense validée",
+            "Récompense refusée",
+        )
     merged_rows = []
 
     for creator_key in ordered_keys:
@@ -1447,11 +1478,22 @@ def merge_collective_reward_tracking_rows(
     return clean_reward_tracking_rows(merged_rows)
 
 
-def style_sent_reward_rows(row):
-    """Met visuellement en vert les récompenses confirmées comme envoyées."""
-    if bool(row.get("Récompense envoyée", False)):
+def style_reward_status_rows(row):
+    """Colore toute la ligne selon la décision administrateur."""
+    if bool(row.get("Récompense refusée", False)):
         return [
-            "background-color: #b7f7d0; color: #073b24; font-weight: 700"
+            (
+                "background-color: #f4b7b7; color: #6b0f1a; "
+                "font-weight: 800; border-color: #d6455d"
+            )
+            for _ in row
+        ]
+    if bool(row.get("Récompense validée", False)):
+        return [
+            (
+                "background-color: #b7f7d0; color: #073b24; "
+                "font-weight: 800; border-color: #22a06b"
+            )
             for _ in row
         ]
     return ["" for _ in row]
@@ -1467,6 +1509,7 @@ def synchronize_reward_tracking_editor():
         return
 
     updated_table = current_table.copy().reset_index(drop=True)
+    reset_editor_after_status_change = False
     editable_columns = {
         "Date",
         "Heure",
@@ -1474,7 +1517,9 @@ def synchronize_reward_tracking_editor():
         "Rémunération consultant / responsable",
     }
     if globals().get("current_user_role") == "admin":
-        editable_columns.add("Récompense envoyée")
+        editable_columns.update(
+            {"Récompense validée", "Récompense refusée"}
+        )
     for row_index, changes in editor_state.get("edited_rows", {}).items():
         try:
             row_number = int(row_index)
@@ -1482,14 +1527,47 @@ def synchronize_reward_tracking_editor():
             continue
         if row_number < 0 or row_number >= len(updated_table):
             continue
+        status_columns = {
+            "Récompense validée",
+            "Récompense refusée",
+        }
+        changed_status_columns = [
+            column
+            for column in status_columns
+            if column in changes
+            and bool(changes[column])
+            != bool(updated_table.at[row_number, column])
+        ]
+        if changed_status_columns:
+            reset_editor_after_status_change = True
         for column, value in changes.items():
-            if column in editable_columns:
+            if column in editable_columns and column not in status_columns:
                 updated_table.at[row_number, column] = value
+        if globals().get("current_user_role") == "admin":
+            activated_statuses = [
+                column
+                for column in changed_status_columns
+                if bool(changes[column])
+            ]
+            if len(activated_statuses) == 1:
+                activated_status = activated_statuses[0]
+                other_status = (
+                    "Récompense refusée"
+                    if activated_status == "Récompense validée"
+                    else "Récompense validée"
+                )
+                updated_table.at[row_number, activated_status] = True
+                updated_table.at[row_number, other_status] = False
+            elif not activated_statuses:
+                for status_column in changed_status_columns:
+                    updated_table.at[row_number, status_column] = False
 
     st.session_state.reward_tracking_table = pd.DataFrame(
         clean_reward_tracking_rows(updated_table.to_dict("records")),
         columns=REWARD_TRACKING_COLUMNS,
     )
+    if reset_editor_after_status_change:
+        st.session_state.pop("reward_tracking_editor", None)
 
 
 def excluded_emails(scope):
@@ -1914,9 +1992,9 @@ def show_financial_summary(dataframe):
 
 BASE_AUTHORIZED_USERS = {
     "tomeventfrance@gmail.com": {
-        "name": "Thomas",
+        "name": "FONDATEUR ADMIN",
         "role": "admin",
-        "direction": "Administration",
+        "direction": "Administration générale",
     },
     "a.stone.authorbusiness@gmail.com": {
         "name": "Biker",
@@ -2589,6 +2667,10 @@ elif page == "💬 Chat collectif":
             return
 
         for chat_message in chat_messages:
+            displayed_author_name = AUTHORIZED_USERS.get(
+                normalize_email(chat_message["author_email"]),
+                {},
+            ).get("name", chat_message["author_name"])
             role_label = COLLABORATOR_ROLE_LABELS.get(
                 chat_message["author_role"],
                 "Administrateur"
@@ -2602,7 +2684,7 @@ elif page == "💬 Chat collectif":
                 f"""
                 <div class="pc-chat-message">
                     <div class="pc-chat-meta">
-                        {escape(str(chat_message['author_name']))}
+                        {escape(str(displayed_author_name))}
                         • {escape(str(role_label))}
                         • {escape(format_chat_datetime(chat_message['created_at']))}
                     </div>
@@ -3401,17 +3483,68 @@ elif page == "🔐 Accès collaborateurs":
             "des quatre directions."
         )
 
+    known_authorized_emails = set(BASE_AUTHORIZED_USERS)
+    known_authorized_emails.update(
+        row["email"] for row in existing_access_rows
+    )
+    detected_access_emails = set()
+    email_pattern = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+    if st.session_state.backstage_data is not None:
+        for email_column in ("Agent", "Groupe"):
+            if email_column not in st.session_state.backstage_data.columns:
+                continue
+            for value in (
+                st.session_state.backstage_data[email_column]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .unique()
+            ):
+                detected_email = normalize_email(value)
+                if email_pattern.fullmatch(detected_email):
+                    detected_access_emails.add(detected_email)
+    for exclusion_row in st.session_state.get("exclusions", []):
+        detected_email = normalize_email(
+            exclusion_row.get("Adresse e-mail", "")
+        )
+        if email_pattern.fullmatch(detected_email):
+            detected_access_emails.add(detected_email)
+
+    detected_access_emails.difference_update(known_authorized_emails)
+    manual_email_option = "✍️ Ajouter une adresse manuellement"
+    selectable_email_options = sorted(detected_access_emails) + [
+        manual_email_option
+    ]
+
     st.subheader("Ajouter un collaborateur")
+    selected_collaborator_email = st.selectbox(
+        "Adresse Google autorisée",
+        options=selectable_email_options,
+        help=(
+            "Les adresses déjà détectées dans l’export Backstage et les "
+            "exclusions sont proposées automatiquement."
+        ),
+        key="selected_existing_collaborator_email",
+    )
+
     with st.form("add_collaborator_access_form", clear_on_submit=True):
         add_name_column, add_email_column = st.columns(2)
         new_collaborator_name = add_name_column.text_input(
             "Nom affiché",
             placeholder="Exemple : Marie",
         )
-        new_collaborator_email = add_email_column.text_input(
-            "Adresse Google autorisée",
-            placeholder="nom@gmail.com",
-        )
+        if selected_collaborator_email == manual_email_option:
+            new_collaborator_email = add_email_column.text_input(
+                "Nouvelle adresse Google",
+                placeholder="nom@gmail.com",
+            )
+        else:
+            add_email_column.text_input(
+                "Adresse sélectionnée",
+                value=selected_collaborator_email,
+                disabled=True,
+            )
+            new_collaborator_email = selected_collaborator_email
         add_role_column, add_groups_column = st.columns(2)
         new_collaborator_role_label = add_role_column.selectbox(
             "Rôle",
@@ -3434,14 +3567,12 @@ elif page == "🔐 Accès collaborateurs":
             label: role
             for role, label in COLLABORATOR_ROLE_LABELS.items()
         }
-        known_emails = set(BASE_AUTHORIZED_USERS)
-        known_emails.update(row["email"] for row in existing_access_rows)
         validation_error = None
         if not str(new_collaborator_name or "").strip():
             validation_error = "Le nom du collaborateur est obligatoire."
         elif not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized_new_email):
             validation_error = "L’adresse e-mail indiquée n’est pas valide."
-        elif normalized_new_email in known_emails:
+        elif normalized_new_email in known_authorized_emails:
             validation_error = "Cette adresse possède déjà un accès."
         elif not new_collaborator_groups:
             validation_error = "Attribuez au moins un groupe."
@@ -3475,6 +3606,10 @@ elif page == "🔐 Accès collaborateurs":
                     "success",
                     "Le collaborateur est autorisé. Il peut maintenant se "
                     "connecter avec cette adresse Google.",
+                )
+                st.session_state.pop(
+                    "selected_existing_collaborator_email",
+                    None,
                 )
                 st.rerun()
             except Exception:
@@ -4074,6 +4209,13 @@ elif page == "🎁 Suivi récompenses":
         "groupes. Un créateur "
         "payé en Facture € apparaît automatiquement à 0 💎 dans ce suivi."
     )
+    if current_user_role in {"admin", "director"}:
+        st.caption(
+            "L’administration et les directeurs peuvent modifier les champs "
+            "de suivi de toutes les lignes. Les montants automatiques restent "
+            "protégés ; les décisions Validée / Refusée sont réservées à "
+            "FONDATEUR ADMIN."
+        )
     tracking_reset_notice = st.session_state.pop(
         "reward_tracking_reset_notice",
         None,
@@ -4292,11 +4434,19 @@ elif page == "🎁 Suivi récompenses":
                 format="%d 💎",
                 help="Calcul automatique et non modifiable.",
             ),
-            "Récompense envoyée": st.column_config.CheckboxColumn(
-                "Récompense envoyée",
+            "Récompense validée": st.column_config.CheckboxColumn(
+                "✅ Validée",
                 help=(
-                    "Seul l’administrateur peut confirmer ou annuler "
-                    "l’envoi de la récompense."
+                    "Seul FONDATEUR ADMIN peut confirmer l’envoi. La ligne "
+                    "devient verte."
+                ),
+                default=False,
+            ),
+            "Récompense refusée": st.column_config.CheckboxColumn(
+                "⛔ Refusée",
+                help=(
+                    "Seul FONDATEUR ADMIN peut refuser la récompense. La "
+                    "ligne devient rouge."
                 ),
                 default=False,
             ),
@@ -4309,7 +4459,7 @@ elif page == "🎁 Suivi récompenses":
     if current_user_role == "performance_manager":
         st.subheader("Vue collective complète")
         st.dataframe(
-            tracking_table.style.apply(style_sent_reward_rows, axis=1),
+            tracking_table.style.apply(style_reward_status_rows, axis=1),
             use_container_width=True,
             hide_index=True,
             column_config=tracking_column_config,
@@ -4340,7 +4490,7 @@ elif page == "🎁 Suivi récompenses":
         else:
             edited_manager_tracking_table = st.data_editor(
                 manager_editable_table.style.apply(
-                    style_sent_reward_rows,
+                    style_reward_status_rows,
                     axis=1,
                 ),
                 use_container_width=True,
@@ -4351,7 +4501,8 @@ elif page == "🎁 Suivi récompenses":
                     "Groupe",
                     "Récompense créateur",
                     "Total récompense",
-                    "Récompense envoyée",
+                    "Récompense validée",
+                    "Récompense refusée",
                 ],
                 column_config=tracking_column_config,
                 key="manager_reward_tracking_editor",
@@ -4384,10 +4535,12 @@ elif page == "🎁 Suivi récompenses":
             "Total récompense",
         ]
         if current_user_role != "admin":
-            disabled_tracking_columns.append("Récompense envoyée")
+            disabled_tracking_columns.extend(
+                ["Récompense validée", "Récompense refusée"]
+            )
 
         edited_tracking_table = st.data_editor(
-            tracking_table.style.apply(style_sent_reward_rows, axis=1),
+            tracking_table.style.apply(style_reward_status_rows, axis=1),
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
@@ -4396,8 +4549,12 @@ elif page == "🎁 Suivi récompenses":
             key="reward_tracking_editor",
             on_change=synchronize_reward_tracking_editor,
         )
+        synchronized_tracking_table = st.session_state.get(
+            "reward_tracking_table",
+            edited_tracking_table,
+        )
         cleaned_tracking_rows = clean_reward_tracking_rows(
-            edited_tracking_table.to_dict("records")
+            synchronized_tracking_table.to_dict("records")
         )
         rows_to_save = cleaned_tracking_rows
 
@@ -4406,6 +4563,28 @@ elif page == "🎁 Suivi récompenses":
         columns=REWARD_TRACKING_COLUMNS,
     )
     st.session_state.reward_tracking_table = cleaned_tracking_table
+
+    decided_tracking_table = cleaned_tracking_table[
+        cleaned_tracking_table["Récompense validée"]
+        | cleaned_tracking_table["Récompense refusée"]
+    ].copy()
+    if (
+        current_user_role in {"admin", "director"}
+        and not decided_tracking_table.empty
+    ):
+        with st.expander(
+            "🎨 Aperçu intégral des lignes validées et refusées",
+            expanded=True,
+        ):
+            st.dataframe(
+                decided_tracking_table.style.apply(
+                    style_reward_status_rows,
+                    axis=1,
+                ),
+                use_container_width=True,
+                hide_index=True,
+                column_config=tracking_column_config,
+            )
 
     total_creator_rewards = int(
         cleaned_tracking_table["Récompense créateur"].sum()
@@ -4467,7 +4646,7 @@ elif page == "🎁 Suivi récompenses":
                             [],
                         ),
                         local_creators=local_creator_names,
-                        can_update_sent_status=(
+                        can_update_reward_status=(
                             current_user_role == "admin"
                         ),
                         editable_groups=editable_groups_for_save,
