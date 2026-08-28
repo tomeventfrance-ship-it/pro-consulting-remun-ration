@@ -647,6 +647,7 @@ def show_excel_download(
         ),
         key=key,
         use_container_width=True,
+        on_click="ignore",
     )
 
 
@@ -668,6 +669,7 @@ def show_workbook_download(
         key=key,
         use_container_width=True,
         type="primary",
+        on_click="ignore",
     )
 
 
@@ -834,6 +836,32 @@ def load_persistent_scope(database_url, scope):
     return dict(payload)
 
 
+def load_persistent_scopes(database_url, scopes):
+    """Charge plusieurs blocs persistants avec une seule connexion."""
+    requested_scopes = tuple(dict.fromkeys(str(scope) for scope in scopes))
+    if not requested_scopes:
+        return {}
+
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT scope, payload
+                FROM pro_consulting_settings
+                WHERE scope = ANY(%s)
+                """,
+                (list(requested_scopes),),
+            )
+            rows = cursor.fetchall()
+
+    loaded_scopes = {scope: {} for scope in requested_scopes}
+    for scope, payload in rows:
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        loaded_scopes[str(scope)] = dict(payload)
+    return loaded_scopes
+
+
 def save_persistent_scopes(database_url, scopes, updated_by):
     """Enregistre plusieurs blocs de paramètres dans une transaction."""
     with psycopg.connect(database_url) as connection:
@@ -860,6 +888,18 @@ def save_persistent_scopes(database_url, scopes, updated_by):
                     ),
                 )
         connection.commit()
+
+    # Les accès sont consultés très souvent par Streamlit. Leur cache court
+    # est invalidé après toute écriture afin qu'une modification faite par
+    # l'administrateur soit visible immédiatement dans ce processus.
+    authorization_scopes = {
+        "admin:director_management",
+        "admin:collaborator_access",
+    }
+    if authorization_scopes.intersection(scopes):
+        authorization_loader = globals().get("load_authorization_payloads")
+        if authorization_loader is not None:
+            authorization_loader.clear()
 
 
 def delete_persistent_scopes(database_url, scopes):
@@ -900,6 +940,16 @@ def director_management_scope():
 def collaborator_access_scope():
     """Accès ajoutés et gérés uniquement depuis le compte administrateur."""
     return "admin:collaborator_access"
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_authorization_payloads(database_url):
+    """Mémorise brièvement les accès pour accélérer les reruns de widgets."""
+    scope_names = (
+        director_management_scope(),
+        collaborator_access_scope(),
+    )
+    return load_persistent_scopes(database_url, scope_names)
 
 
 def reward_tracking_scope():
@@ -1253,6 +1303,7 @@ def base64url_without_padding(value):
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_or_create_web_push_keys(database_url):
     """Crée une seule paire VAPID et la conserve uniquement côté serveur."""
     initialize_settings_database(database_url)
@@ -1715,22 +1766,17 @@ def apply_persistent_settings(database_url, user_email):
     """Recharge les réglages communs et ceux de la direction connectée."""
     initialize_settings_database(database_url)
 
-    global_settings = load_persistent_scope(
-        database_url,
+    scope_names = (
         "global:financial",
-    )
-    exchange_rate_settings = load_persistent_scope(
-        database_url,
         "global:exchange_rate",
-    )
-    branch_settings = load_persistent_scope(
-        database_url,
         branch_settings_scope(user_email),
-    )
-    exclusions_settings = load_persistent_scope(
-        database_url,
         exclusions_scope(user_email),
     )
+    loaded_scopes = load_persistent_scopes(database_url, scope_names)
+    global_settings = loaded_scopes["global:financial"]
+    exchange_rate_settings = loaded_scopes["global:exchange_rate"]
+    branch_settings = loaded_scopes[branch_settings_scope(user_email)]
+    exclusions_settings = loaded_scopes[exclusions_scope(user_email)]
 
     for key in GLOBAL_FINANCIAL_KEYS:
         if key in global_settings:
@@ -2777,10 +2823,10 @@ def build_authorized_users(database_url):
 
     try:
         initialize_settings_database(database_url)
-        director_payload = load_persistent_scope(
-            database_url,
-            director_management_scope(),
-        )
+        authorization_payloads = load_authorization_payloads(database_url)
+        director_payload = authorization_payloads[
+            director_management_scope()
+        ]
         director_config = director_payload.get("directors", {})
         if isinstance(director_config, dict):
             for email, saved_row in director_config.items():
@@ -2793,10 +2839,9 @@ def build_authorized_users(database_url):
                         saved_row.get("groups", [])
                     )
 
-        collaborator_payload = load_persistent_scope(
-            database_url,
-            collaborator_access_scope(),
-        )
+        collaborator_payload = authorization_payloads[
+            collaborator_access_scope()
+        ]
         collaborator_rows = clean_collaborator_access_records(
             collaborator_payload.get("collaborators", [])
         )
@@ -3284,14 +3329,7 @@ def open_collective_chat_from_notification():
     st.rerun(scope="app")
 
 
-if persistent_settings_available:
-    internal_notification_fragment = (
-        st.fragment(run_every="10s")
-        if hasattr(st, "fragment")
-        else (lambda function: function)
-    )
-
-    @internal_notification_fragment
+if persistent_settings_available and page != CHAT_PAGE_LABEL:
     def render_internal_chat_notification():
         try:
             notification_summary = load_chat_notification_summary(
@@ -3303,7 +3341,7 @@ if persistent_settings_available:
 
         unread_count = notification_summary["unread_count"]
         latest_unread_id = notification_summary["latest_unread_id"]
-        if not unread_count or page == CHAT_PAGE_LABEL:
+        if not unread_count:
             return
 
         latest_message = notification_summary.get("latest_message") or {}
@@ -4306,14 +4344,13 @@ elif page == "🔐 Accès collaborateurs":
     saved_access_payload = {}
     saved_director_payload = {}
     try:
-        saved_access_payload = load_persistent_scope(
-            database_url,
-            collaborator_access_scope(),
-        )
-        saved_director_payload = load_persistent_scope(
-            database_url,
-            director_management_scope(),
-        )
+        authorization_payloads = load_authorization_payloads(database_url)
+        saved_access_payload = authorization_payloads[
+            collaborator_access_scope()
+        ]
+        saved_director_payload = authorization_payloads[
+            director_management_scope()
+        ]
     except Exception:
         st.error(
             "Les accès enregistrés ne peuvent pas être chargés. Aucune "
@@ -5595,6 +5632,7 @@ elif page == "🎁 Suivi récompenses":
         ),
         key="download_collective_reward_tracking",
         use_container_width=True,
+        on_click="ignore",
     )
     st.caption(
         "Dans le fichier téléchargé, le choix Live/Match est conservé et "
