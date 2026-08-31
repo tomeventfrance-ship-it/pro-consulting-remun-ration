@@ -968,6 +968,18 @@ def legacy_reward_tracking_scope(month):
     )
 
 
+def reward_tracking_archive_scope(month):
+    """Archive immuable d'un mois collectif termine."""
+    return ":".join(
+        [
+            "shared",
+            "reward_tracking",
+            "archive",
+            safe_export_name(month),
+        ]
+    )
+
+
 CHAT_RETENTION_HOURS = 48
 CHAT_MAX_MESSAGE_LENGTH = 2000
 WEB_PUSH_KEYS_SCOPE = "system:web_push_keys:v1"
@@ -2206,6 +2218,159 @@ def merge_collective_reward_tracking_rows(
     return clean_reward_tracking_rows(merged_rows)
 
 
+def save_collective_reward_tracking(
+    database_url,
+    scope,
+    local_rows,
+    baseline_rows,
+    local_creators,
+    requested_month,
+    updated_by,
+    can_update_reward_status=False,
+    editable_groups=None,
+    allow_new_rows=True,
+):
+    """Fusionne et confirme une sauvegarde collective dans une transaction.
+
+    Le verrou PostgreSQL empeche deux sessions ouvertes en meme temps de
+    s'ecraser. Lors d'un changement de mois, le registre precedent est
+    archive avant que le nouveau mois ne soit cree sans ses champs manuels.
+    """
+    requested_month = str(requested_month or "").strip()
+    updated_by = normalize_email(updated_by)
+
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            # Ce verrou fonctionne meme si la ligne du registre n'existe pas
+            # encore, contrairement a un simple SELECT ... FOR UPDATE.
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (scope,),
+            )
+            cursor.execute(
+                """
+                SELECT payload
+                FROM pro_consulting_settings
+                WHERE scope = %s
+                FOR UPDATE
+                """,
+                (scope,),
+            )
+            row = cursor.fetchone()
+            remote_payload = row[0] if row else {}
+            if isinstance(remote_payload, str):
+                remote_payload = json.loads(remote_payload)
+            remote_payload = dict(remote_payload or {})
+
+            remote_month = str(remote_payload.get("month") or "").strip()
+            starts_new_month = bool(
+                remote_payload
+                and requested_month
+                and remote_month
+                and remote_month.casefold() != requested_month.casefold()
+            )
+
+            if starts_new_month:
+                archive_scope = reward_tracking_archive_scope(remote_month)
+                cursor.execute(
+                    """
+                    INSERT INTO pro_consulting_settings (
+                        scope,
+                        payload,
+                        updated_by
+                    )
+                    VALUES (%s, %s::jsonb, %s)
+                    ON CONFLICT (scope)
+                    DO UPDATE SET
+                        payload = EXCLUDED.payload,
+                        updated_at = CURRENT_TIMESTAMP,
+                        updated_by = EXCLUDED.updated_by
+                    """,
+                    (
+                        archive_scope,
+                        json.dumps(remote_payload, ensure_ascii=False),
+                        updated_by,
+                    ),
+                )
+                remote_rows = []
+                effective_baseline_rows = []
+            else:
+                remote_rows = remote_payload.get("rows", [])
+                effective_baseline_rows = baseline_rows
+
+            merged_rows = merge_collective_reward_tracking_rows(
+                remote_rows=remote_rows,
+                local_rows=local_rows,
+                baseline_rows=effective_baseline_rows,
+                local_creators=local_creators,
+                can_update_reward_status=can_update_reward_status,
+                editable_groups=editable_groups,
+                allow_new_rows=allow_new_rows,
+            )
+            saved_moment = datetime.now(ZoneInfo("Europe/Paris"))
+            saved_at = saved_moment.isoformat(timespec="seconds")
+            save_token = hashlib.sha256(
+                (
+                    f"{scope}|{updated_by}|{saved_moment.isoformat()}|"
+                    f"{len(merged_rows)}"
+                ).encode("utf-8")
+            ).hexdigest()[:20]
+            saved_payload = {
+                "month": requested_month or remote_month,
+                "rows": merged_rows,
+                "saved_at": saved_at,
+                "saved_by": updated_by,
+                "save_token": save_token,
+            }
+            cursor.execute(
+                """
+                INSERT INTO pro_consulting_settings (
+                    scope,
+                    payload,
+                    updated_by
+                )
+                VALUES (%s, %s::jsonb, %s)
+                ON CONFLICT (scope)
+                DO UPDATE SET
+                    payload = EXCLUDED.payload,
+                    updated_at = CURRENT_TIMESTAMP,
+                    updated_by = EXCLUDED.updated_by
+                RETURNING payload
+                """,
+                (
+                    scope,
+                    json.dumps(saved_payload, ensure_ascii=False),
+                    updated_by,
+                ),
+            )
+            confirmed_payload = cursor.fetchone()[0]
+            if isinstance(confirmed_payload, str):
+                confirmed_payload = json.loads(confirmed_payload)
+            confirmed_payload = dict(confirmed_payload or {})
+            if (
+                confirmed_payload.get("save_token") != save_token
+                or normalize_email(confirmed_payload.get("saved_by"))
+                != updated_by
+            ):
+                raise RuntimeError(
+                    "La base n'a pas confirme la nouvelle version du suivi."
+                )
+        connection.commit()
+
+    # Une seconde connexion prouve que la transaction est effectivement
+    # visible pour les autres comptes, pas seulement dans la session courante.
+    persisted_payload = load_persistent_scope(database_url, scope)
+    if (
+        persisted_payload.get("save_token") != save_token
+        or normalize_email(persisted_payload.get("saved_by")) != updated_by
+    ):
+        raise RuntimeError(
+            "La sauvegarde n'est pas visible depuis une nouvelle connexion."
+        )
+
+    return persisted_payload, starts_new_month
+
+
 def style_reward_status_rows(row):
     """Colore toute la ligne selon la décision administrateur."""
     if bool(row.get("Récompense refusée", False)):
@@ -2331,6 +2496,7 @@ def reset_calculations():
         "reward_tracking_active_month",
         "reward_tracking_last_saved_at",
         "reward_tracking_last_saved_by",
+        "reward_tracking_pending_new_month",
         "reward_tracking_save_notice",
     ):
         st.session_state.pop(key, None)
@@ -5157,6 +5323,7 @@ elif page == "🎁 Suivi récompenses":
         st.session_state.pop("reward_tracking_active_month", None)
         st.session_state.pop("reward_tracking_last_saved_at", None)
         st.session_state.pop("reward_tracking_last_saved_by", None)
+        st.session_state.pop("reward_tracking_pending_new_month", None)
 
     if not persistent_settings_available:
         st.error(
@@ -5241,6 +5408,23 @@ elif page == "🎁 Suivi récompenses":
                     "pour le moment."
                 )
 
+        saved_tracking_month = str(
+            saved_tracking_payload.get("month") or ""
+        ).strip()
+        requested_tracking_month = str(st.session_state.month or "").strip()
+        pending_new_month = bool(
+            saved_tracking_payload
+            and st.session_state.backstage_data is not None
+            and saved_tracking_month
+            and requested_tracking_month
+            and saved_tracking_month.casefold()
+            != requested_tracking_month.casefold()
+        )
+        if pending_new_month:
+            # Le nouvel export ne doit jamais recuperer les dates, heures,
+            # decisions ou montants manuels du mois precedent.
+            saved_tracking_rows = []
+
         st.session_state.reward_tracking_table = (
             build_reward_tracking_table(
                 creator_results_for_tracking,
@@ -5251,7 +5435,9 @@ elif page == "🎁 Suivi récompenses":
             st.session_state.reward_tracking_table.to_dict("records")
         )
         st.session_state.reward_tracking_active_month = (
-            saved_tracking_payload.get("month") or st.session_state.month
+            requested_tracking_month
+            if pending_new_month
+            else saved_tracking_payload.get("month") or st.session_state.month
         )
         st.session_state.reward_tracking_last_saved_at = (
             saved_tracking_payload.get("saved_at")
@@ -5259,6 +5445,7 @@ elif page == "🎁 Suivi récompenses":
         st.session_state.reward_tracking_last_saved_by = (
             saved_tracking_payload.get("saved_by")
         )
+        st.session_state.reward_tracking_pending_new_month = pending_new_month
         st.session_state.reward_tracking_loaded_scope = tracking_scope
         st.session_state.pop("reward_tracking_editor", None)
         st.session_state.pop("manager_reward_tracking_editor", None)
@@ -5281,6 +5468,12 @@ elif page == "🎁 Suivi récompenses":
         st.success(
             "☁️ Registre collectif unique actif : tous les collaborateurs "
             "autorisés utilisent le même tableau."
+        )
+    if st.session_state.get("reward_tracking_pending_new_month"):
+        st.info(
+            f"🗓️ Nouveau mois détecté : {active_tracking_month}. "
+            "Le suivi précédent sera archivé lors du premier "
+            "enregistrement confirmé ; ses saisies ne seront pas reprises."
         )
     last_tracking_save = st.session_state.get(
         "reward_tracking_last_saved_at"
@@ -5543,10 +5736,6 @@ elif page == "🎁 Suivi récompenses":
     ):
         if persistent_settings_available:
             try:
-                latest_tracking_payload = load_persistent_scope(
-                    database_url,
-                    tracking_scope,
-                )
                 local_creator_names = (
                     creator_results_for_tracking["Pseudo"]
                     .fillna("")
@@ -5555,15 +5744,18 @@ elif page == "🎁 Suivi récompenses":
                     if "Pseudo" in creator_results_for_tracking.columns
                     else []
                 )
-                merged_tracking_rows = (
-                    merge_collective_reward_tracking_rows(
-                        remote_rows=latest_tracking_payload.get("rows", []),
+                confirmed_payload, started_new_month = (
+                    save_collective_reward_tracking(
+                        database_url=database_url,
+                        scope=tracking_scope,
                         local_rows=rows_to_save,
                         baseline_rows=st.session_state.get(
                             "reward_tracking_baseline_rows",
                             [],
                         ),
                         local_creators=local_creator_names,
+                        requested_month=active_tracking_month,
+                        updated_by=current_user_email,
                         can_update_reward_status=(
                             current_user_role == "admin"
                         ),
@@ -5571,22 +5763,9 @@ elif page == "🎁 Suivi récompenses":
                         allow_new_rows=allow_new_tracking_rows,
                     )
                 )
-                saved_at = datetime.now().isoformat(timespec="seconds")
-                shared_active_month = latest_tracking_payload.get(
-                    "month"
-                ) or active_tracking_month
-                save_persistent_scopes(
-                    database_url,
-                    {
-                        tracking_scope: {
-                            "month": shared_active_month,
-                            "rows": merged_tracking_rows,
-                            "saved_at": saved_at,
-                            "saved_by": current_user_email,
-                        }
-                    },
-                    current_user_email,
-                )
+                merged_tracking_rows = confirmed_payload.get("rows", [])
+                saved_at = confirmed_payload.get("saved_at")
+                shared_active_month = confirmed_payload.get("month")
                 st.session_state.reward_tracking_table = (
                     build_reward_tracking_table(
                         creator_results_for_tracking,
@@ -5603,14 +5782,24 @@ elif page == "🎁 Suivi récompenses":
                 st.session_state.reward_tracking_last_saved_by = (
                     current_user_email
                 )
-                st.success(
-                    "Le suivi collectif est enregistré et fusionné avec les "
-                    "dernières saisies des autres collaborateurs."
-                )
-            except Exception:
+                st.session_state.reward_tracking_pending_new_month = False
+                if started_new_month:
+                    st.success(
+                        f"Le suivi {shared_active_month} est enregistré et "
+                        "confirmé. Le mois précédent a été archivé sans "
+                        "mélange de données."
+                    )
+                else:
+                    st.success(
+                        "Le suivi collectif est enregistré, fusionné et "
+                        "confirmé par la base PostgreSQL."
+                    )
+            except Exception as error:
                 st.error(
-                    "La sauvegarde permanente a échoué. Ne fermez pas la "
-                    "session avant d’avoir téléchargé le fichier Excel."
+                    "La sauvegarde permanente a échoué et n'a pas été "
+                    "annoncée comme réussie. Ne fermez pas la session avant "
+                    "d’avoir téléchargé le fichier Excel. "
+                    f"Détail technique : {type(error).__name__}."
                 )
         else:
             if persistent_settings_error:
