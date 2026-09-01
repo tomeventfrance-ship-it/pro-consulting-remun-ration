@@ -28,6 +28,7 @@ from utils import (
 )
 from tournaments import (
     add_participants,
+    build_round_schedule,
     create_tournament,
     delete_tournament,
     finalize_draw,
@@ -40,6 +41,7 @@ from tournaments import (
     set_match_winner,
     tournament_tables,
     update_match_schedule,
+    update_round_schedule,
     update_tournament_options,
     validate_prepared_draw,
 )
@@ -103,6 +105,31 @@ st.markdown(
 
     h1 {
         font-weight: 780 !important;
+    }
+
+    /* Libellés bien lisibles sur mobile et ordinateur. */
+    [data-testid="stWidgetLabel"],
+    [data-testid="stWidgetLabel"] p,
+    [data-testid="stTextInput"] label,
+    [data-testid="stNumberInput"] label,
+    [data-testid="stSelectbox"] label,
+    [data-testid="stMultiSelect"] label,
+    [data-testid="stDateInput"] label,
+    [data-testid="stTextArea"] label {
+        color: #fff8ea !important;
+        opacity: 1 !important;
+        font-weight: 700 !important;
+    }
+
+    @media (max-width: 768px) {
+        [data-testid="stWidgetLabel"] p,
+        [data-testid="stTextInput"] label,
+        [data-testid="stNumberInput"] label,
+        [data-testid="stSelectbox"] label,
+        [data-testid="stDateInput"] label {
+            font-size: 0.98rem !important;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.75);
+        }
     }
 
     h2, h3 {
@@ -722,6 +749,17 @@ GLOBAL_EXCHANGE_RATE_KEYS = (
     "usd_to_eur",
     "last_ecb_usd_to_eur",
     "last_ecb_rate_date",
+)
+
+SHARED_MONTHLY_PARAMETER_KEYS = (
+    "month",
+    "creator_level",
+    "consultant_level",
+    "manager_level",
+    "director_level",
+    "revenue_usd",
+    "other_expenses",
+    "use_ecb_rate",
 )
 
 BRANCH_PARAMETER_KEYS = (
@@ -1872,12 +1910,14 @@ def apply_persistent_settings(database_url, user_email):
     scope_names = (
         "global:financial",
         "global:exchange_rate",
+        "global:monthly_parameters",
         branch_settings_scope(user_email),
         exclusions_scope(user_email),
     )
     loaded_scopes = load_persistent_scopes(database_url, scope_names)
     global_settings = loaded_scopes["global:financial"]
     exchange_rate_settings = loaded_scopes["global:exchange_rate"]
+    shared_monthly_settings = loaded_scopes["global:monthly_parameters"]
     branch_settings = loaded_scopes[branch_settings_scope(user_email)]
     exclusions_settings = loaded_scopes[exclusions_scope(user_email)]
 
@@ -1892,6 +1932,11 @@ def apply_persistent_settings(database_url, user_email):
     for key in BRANCH_PARAMETER_KEYS:
         if key in branch_settings:
             st.session_state[key] = branch_settings[key]
+
+    # La validation du fondateur prime sur les anciens réglages individuels.
+    for key in SHARED_MONTHLY_PARAMETER_KEYS:
+        if key in shared_monthly_settings:
+            st.session_state[key] = shared_monthly_settings[key]
 
     # Une absence de liste persistante doit vider les exclusions afin
     # qu'un changement de compte ne puisse jamais réutiliser celles d'une
@@ -4442,6 +4487,86 @@ elif page == "🏆 Tournois":
             f"**{waiting_participant.get('name', '')}**"
         )
 
+    complete_schedule = tournament.get("round_schedule", []) or (
+        build_round_schedule(
+            len(tournament.get("competitors", [])), tournament["format"]
+        )
+        if tournament.get("competitors")
+        else []
+    )
+    if complete_schedule:
+        st.subheader("Planning complet du tournoi")
+        st.caption(
+            "Tous les tours, jusqu’à la finale, sont préparés dès maintenant. "
+            "Les adversaires suivants apparaîtront après les résultats."
+        )
+        schedule_dataframe = pd.DataFrame(
+            [
+                {
+                    "N° tour": int(row.get("round_number", 0)),
+                    "Tour": row.get("round_label", ""),
+                    "Match": int(row.get("match_number", 0)),
+                    "Date": row.get("date", ""),
+                    "Heure": row.get("time", ""),
+                }
+                for row in complete_schedule
+            ]
+        )
+        if current_user_role == "admin":
+            with st.form(
+                f"complete_schedule_form_{selected_tournament_id}"
+            ):
+                edited_schedule_dataframe = st.data_editor(
+                    schedule_dataframe,
+                    use_container_width=True,
+                    hide_index=True,
+                    disabled=["N° tour", "Tour", "Match"],
+                    column_config={
+                        "N° tour": st.column_config.NumberColumn(width="small"),
+                        "Tour": st.column_config.TextColumn(width="medium"),
+                        "Match": st.column_config.NumberColumn(width="small"),
+                        "Date": st.column_config.TextColumn(width="medium"),
+                        "Heure": st.column_config.TextColumn(width="small"),
+                    },
+                    key=f"complete_schedule_editor_{selected_tournament_id}",
+                )
+                save_complete_schedule = st.form_submit_button(
+                    "💾 Enregistrer toutes les dates et heures",
+                    type="primary",
+                    use_container_width=True,
+                )
+            if save_complete_schedule:
+                try:
+                    schedule_rows_to_save = [
+                        {
+                            "round_number": int(row["N° tour"]),
+                            "round_label": row["Tour"],
+                            "match_number": int(row["Match"]),
+                            "date": "" if pd.isna(row["Date"]) else row["Date"],
+                            "time": "" if pd.isna(row["Heure"]) else row["Heure"],
+                        }
+                        for row in edited_schedule_dataframe.to_dict("records")
+                    ]
+                    update_round_schedule(
+                        database_url,
+                        selected_tournament_id,
+                        schedule_rows_to_save,
+                        current_user_email,
+                        current_user_role,
+                    )
+                    st.success(
+                        "Le planning complet est enregistré jusqu’à la finale."
+                    )
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Planning non enregistré : {error}")
+        else:
+            st.dataframe(
+                schedule_dataframe,
+                use_container_width=True,
+                hide_index=True,
+            )
+
     if tournament.get("matches"):
         st.subheader("Tableau du tournoi")
         round_numbers = sorted(
@@ -4953,16 +5078,23 @@ elif page == "📥 Import Backstage":
 
 elif page == "⚙️ Paramètres":
     st.title("⚙️ Paramètres mensuels")
-    st.info(
-        "Les quatre paliers sont indépendants et doivent être "
-        "sélectionnés chaque mois."
-    )
+    parameters_locked = current_user_role != "admin"
+    if parameters_locked:
+        st.success(
+            "✅ Ces paramètres ont été définis pour toute l’équipe par "
+            "FONDATEUR ADMIN. Vous n’avez rien à modifier."
+        )
+    else:
+        st.info(
+            "Votre validation applique ces paramètres à tous les directeurs. "
+            "Les quatre paliers restent indépendants."
+        )
 
     if persistent_settings_available:
         st.success(
-            "☁️ Sauvegarde permanente active : les paramètres de votre "
-            "direction seront retrouvés après une déconnexion ou un "
-            "redémarrage de l’application."
+            "☁️ Configuration commune active : les paramètres validés par "
+            "FONDATEUR ADMIN sont retrouvés par toute l’équipe après une "
+            "déconnexion ou un redémarrage."
         )
     elif persistent_settings_error:
         st.warning(persistent_settings_error)
@@ -4973,7 +5105,7 @@ elif page == "⚙️ Paramètres":
             "session."
         )
 
-    financial_settings_locked = current_user_role != "admin"
+    financial_settings_locked = parameters_locked
 
     if financial_settings_locked:
         st.caption(
@@ -4988,6 +5120,7 @@ elif page == "⚙️ Paramètres":
         "🔄 Actualiser maintenant",
         key="parameters_refresh_daily_rate",
         use_container_width=True,
+        disabled=parameters_locked,
     )
     daily_rate_info = resolve_daily_usd_to_eur_rate(
         database_url=database_url if persistent_settings_available else None,
@@ -5009,12 +5142,16 @@ elif page == "⚙️ Paramètres":
         left, right = st.columns(2)
 
         with left:
-            month = st.text_input("Mois calculé", st.session_state.month)
+            month = st.text_input(
+                "Mois calculé", st.session_state.month,
+                disabled=parameters_locked,
+            )
             revenue_usd = st.number_input(
                 "Chiffre d’affaires Backstage ($)",
                 min_value=0.0,
                 value=float(st.session_state.revenue_usd),
                 step=100.0,
+                disabled=parameters_locked,
             )
             usd_to_eur = st.number_input(
                 "Taux dollar → euro utilisé aujourd’hui (BCE)",
@@ -5033,6 +5170,7 @@ elif page == "⚙️ Paramètres":
                 min_value=0.0,
                 value=float(st.session_state.other_expenses),
                 step=10.0,
+                disabled=parameters_locked,
             )
 
         with right:
@@ -5042,6 +5180,7 @@ elif page == "⚙️ Paramètres":
                 index=[4, 7, 9, 11, 13, 15].index(
                     int(st.session_state.creator_level)
                 ),
+                disabled=parameters_locked,
             )
             consultant_level = st.selectbox(
                 "Palier Consultants atteint",
@@ -5049,6 +5188,7 @@ elif page == "⚙️ Paramètres":
                 index=[5, 7, 9, 11, 13].index(
                     int(st.session_state.consultant_level)
                 ),
+                disabled=parameters_locked,
             )
             manager_level = st.selectbox(
                 "Palier Responsables performance atteint",
@@ -5056,6 +5196,7 @@ elif page == "⚙️ Paramètres":
                 index=[5, 7, 9, 11, 13].index(
                     int(st.session_state.manager_level)
                 ),
+                disabled=parameters_locked,
             )
             director_level = st.selectbox(
                 "Palier Directeur atteint",
@@ -5063,6 +5204,7 @@ elif page == "⚙️ Paramètres":
                 index=[4, 5, 7, 8, 10, 11, 13].index(
                     int(st.session_state.director_level)
                 ),
+                disabled=parameters_locked,
             )
 
         st.subheader("Paramètres financiers")
@@ -5093,8 +5235,9 @@ elif page == "⚙️ Paramètres":
         )
 
         save_parameters = st.form_submit_button(
-            "💾 Enregistrer les paramètres",
+            "💾 Valider les paramètres pour toute l’équipe",
             use_container_width=True,
+            disabled=parameters_locked,
         )
 
     if save_parameters:
@@ -5136,6 +5279,10 @@ elif page == "⚙️ Paramètres":
                     key: st.session_state[key]
                     for key in GLOBAL_FINANCIAL_KEYS
                 }
+                scopes_to_save["global:monthly_parameters"] = {
+                    key: st.session_state[key]
+                    for key in SHARED_MONTHLY_PARAMETER_KEYS
+                }
 
             try:
                 save_persistent_scopes(
@@ -5160,7 +5307,8 @@ elif page == "⚙️ Paramètres":
 
         if permanent_save_succeeded:
             st.success(
-                "Les paramètres ont été enregistrés définitivement."
+                "Les paramètres ont été validés définitivement pour toute "
+                "l’équipe. Les directeurs n’ont aucune action à effectuer."
             )
         elif permanent_save_error:
             st.error(permanent_save_error)
