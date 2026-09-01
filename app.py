@@ -11,7 +11,7 @@ from streamlit import runtime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from datetime import datetime
+from datetime import date, datetime
 from html import escape
 from io import BytesIO, StringIO
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -25,6 +25,22 @@ from utils import (
     calculate_consultant_rewards,
     calculate_creator_rewards,
     prepare_backstage_data,
+)
+from tournaments import (
+    add_participants,
+    create_tournament,
+    finalize_draw,
+    initialize_tournament_database,
+    list_tournaments,
+    load_tournament,
+    parse_participant_batch,
+    remove_participant,
+    reopen_registrations,
+    set_match_winner,
+    tournament_tables,
+    update_match_schedule,
+    update_tournament_options,
+    validate_prepared_draw,
 )
 
 
@@ -809,6 +825,8 @@ def initialize_settings_database(database_url):
                 """
             )
         connection.commit()
+
+    initialize_tournament_database(database_url)
 
     return True
 
@@ -3434,6 +3452,7 @@ if collaborator_access_load_error and current_user_role == "admin":
 admin_pages = [
     "🏠 Accueil",
     "💬 Chat collectif",
+    "🏆 Tournois",
     "📥 Import Backstage",
     "⚙️ Paramètres",
     "🛡️ Administration",
@@ -3449,6 +3468,7 @@ admin_pages = [
 director_pages = [
     "🏠 Accueil",
     "💬 Chat collectif",
+    "🏆 Tournois",
     "📥 Import Backstage",
     "⚙️ Paramètres",
     "🛡️ Administration",
@@ -3461,6 +3481,7 @@ director_pages = [
 
 performance_manager_pages = [
     "💬 Chat collectif",
+    "🏆 Tournois",
     "🎁 Suivi récompenses",
 ]
 
@@ -3822,6 +3843,686 @@ elif page == "💬 Chat collectif":
                     "Le message n’a pas été enregistré. Vous pouvez le "
                     "copier puis réessayer sans perdre son contenu."
                 )
+
+
+elif page == "🏆 Tournois":
+    render_brand_hero(
+        "Tournois Pro Consulting",
+        "Créez des tournois 1v1 ou 2v2, inscrivez les créateurs en groupe "
+        "et suivez automatiquement les qualifications jusqu’à la finale.",
+        "PRO CONSULTING • COMPÉTITIONS",
+    )
+
+    if not persistent_settings_available:
+        st.error(
+            "Le module Tournois nécessite PostgreSQL afin que les tirages "
+            "et les résultats soient identiques pour tous les comptes."
+        )
+        st.stop()
+
+    tournament_status_labels = {
+        "registration": "📝 Inscriptions ouvertes",
+        "draw_ready": "🎲 Tirage à valider",
+        "validated": "✅ Tableau validé",
+        "in_progress": "▶️ En cours",
+        "finished": "🏆 Terminé",
+        "archived": "📦 Archivé",
+    }
+
+    if current_user_role in {"admin", "director"}:
+        with st.expander("➕ Créer un nouveau tournoi", expanded=False):
+            st.caption(
+                "Le tournoi sera général à la structure depuis le compte "
+                "fondateur, et privé à votre branche depuis un compte "
+                "directeur."
+            )
+            with st.form("create_tournament_form", clear_on_submit=True):
+                new_tournament_title = st.text_input(
+                    "Titre du tournoi",
+                    placeholder="Exemple : Tournoi de septembre",
+                )
+                new_tournament_format = st.radio(
+                    "Format",
+                    ["1v1", "2v2"],
+                    horizontal=True,
+                )
+                new_registration_deadline = st.date_input(
+                    "Date limite d’inscription",
+                    value=date.today(),
+                    format="DD/MM/YYYY",
+                )
+                create_tournament_button = st.form_submit_button(
+                    "Créer le tournoi",
+                    type="primary",
+                    use_container_width=True,
+                )
+            if create_tournament_button:
+                try:
+                    created_tournament_id = create_tournament(
+                        database_url=database_url,
+                        title=new_tournament_title,
+                        tournament_format=new_tournament_format,
+                        registration_deadline=new_registration_deadline,
+                        creator_email=current_user_email,
+                        creator_name=current_user_name,
+                        creator_role=current_user_role,
+                    )
+                    st.session_state.selected_tournament_id = (
+                        created_tournament_id
+                    )
+                    st.success("Le tournoi a été créé.")
+                    st.rerun()
+                except (ValueError, PermissionError) as error:
+                    st.warning(str(error))
+                except Exception:
+                    st.error("La création du tournoi a échoué.")
+
+    refresh_tournament_column, tournament_info_column = st.columns([1, 3])
+    if refresh_tournament_column.button(
+        "🔄 Actualiser",
+        key="refresh_tournaments",
+        use_container_width=True,
+    ):
+        st.rerun()
+    tournament_info_column.caption(
+        "Les tirages, résultats et droits sont relus depuis PostgreSQL."
+    )
+
+    try:
+        available_tournaments = list_tournaments(
+            database_url,
+            current_user_email,
+            current_user_role,
+        )
+    except Exception:
+        st.error("Les tournois ne peuvent pas être chargés pour le moment.")
+        st.stop()
+
+    if not available_tournaments:
+        if current_user_role == "performance_manager":
+            st.info(
+                "Aucun tournoi ne vous est actuellement rendu visible par "
+                "FONDATEUR ADMIN."
+            )
+        else:
+            st.info("Aucun tournoi n’a encore été créé.")
+        st.stop()
+
+    tournament_by_id = {
+        tournament["id"]: tournament
+        for tournament in available_tournaments
+    }
+    tournament_ids = list(tournament_by_id)
+    selected_tournament_id = st.session_state.get(
+        "selected_tournament_id"
+    )
+    if selected_tournament_id not in tournament_by_id:
+        selected_tournament_id = tournament_ids[0]
+
+    selected_tournament_id = st.selectbox(
+        "Tournoi affiché",
+        tournament_ids,
+        index=tournament_ids.index(selected_tournament_id),
+        format_func=lambda tournament_id: (
+            f"{tournament_by_id[tournament_id]['title']} • "
+            f"{tournament_by_id[tournament_id]['format']} • "
+            f"{tournament_status_labels.get(tournament_by_id[tournament_id]['status'], tournament_by_id[tournament_id]['status'])}"
+        ),
+        key="selected_tournament_id",
+    )
+    try:
+        tournament = load_tournament(
+            database_url,
+            selected_tournament_id,
+            current_user_email,
+            current_user_role,
+        )
+    except (ValueError, PermissionError) as error:
+        st.error(str(error))
+        st.stop()
+
+    is_tournament_operator = bool(
+        current_user_role == "admin"
+        or (
+            current_user_role == "director"
+            and (
+                tournament["scope_type"] == "structure"
+                or normalize_email(tournament["owner_email"])
+                == normalize_email(current_user_email)
+            )
+        )
+    )
+    can_finalize_tournament = bool(
+        current_user_role == "admin"
+        or (
+            current_user_role == "director"
+            and tournament["scope_type"] == "branch"
+            and normalize_email(tournament["owner_email"])
+            == normalize_email(current_user_email)
+        )
+    )
+    scope_label = (
+        "Tournoi général de la structure"
+        if tournament["scope_type"] == "structure"
+        else f"Tournoi privé • {tournament['owner_name']}"
+    )
+    st.subheader(tournament["title"])
+    st.caption(
+        f"{scope_label} • Format {tournament['format']} • "
+        f"{tournament_status_labels.get(tournament['status'], tournament['status'])}"
+    )
+
+    participant_rows, match_rows = tournament_tables(tournament)
+    participant_count = len(participant_rows)
+    duo_count = (
+        len(tournament.get("competitors", []))
+        if tournament["format"] == "2v2"
+        else 0
+    )
+    decided_match_count = sum(
+        bool(match.get("winner_id")) and not match.get("bye")
+        for match in tournament.get("matches", [])
+    )
+    summary_columns = st.columns(4)
+    summary_columns[0].metric("Inscrits", participant_count)
+    summary_columns[1].metric(
+        "Duos",
+        duo_count if tournament["format"] == "2v2" else "—",
+    )
+    summary_columns[2].metric("Matchs générés", len(match_rows))
+    summary_columns[3].metric("Résultats saisis", decided_match_count)
+
+    if current_user_role == "admin":
+        with st.expander("⚙️ Contrôle fondateur", expanded=False):
+            deadline_value = tournament.get("registration_deadline")
+            try:
+                deadline_value = date.fromisoformat(deadline_value)
+            except (TypeError, ValueError):
+                deadline_value = date.today()
+            with st.form(
+                f"founder_tournament_options_{selected_tournament_id}"
+            ):
+                edited_tournament_title = st.text_input(
+                    "Titre",
+                    value=tournament["title"],
+                )
+                edited_tournament_deadline = st.date_input(
+                    "Date limite d’inscription",
+                    value=deadline_value,
+                    format="DD/MM/YYYY",
+                )
+                manager_visibility = st.checkbox(
+                    "Visible en lecture seule par les responsables performance",
+                    value=bool(tournament["visible_to_managers"]),
+                    disabled=tournament["status"] in {"registration", "draw_ready", "archived"},
+                )
+                archive_tournament = st.checkbox(
+                    "Archiver et retirer le tournoi des responsables performance",
+                    value=tournament["status"] == "archived",
+                )
+                save_tournament_options = st.form_submit_button(
+                    "Enregistrer les réglages",
+                    use_container_width=True,
+                )
+            if save_tournament_options:
+                try:
+                    update_tournament_options(
+                        database_url,
+                        selected_tournament_id,
+                        current_user_email,
+                        current_user_role,
+                        title=edited_tournament_title,
+                        registration_deadline=edited_tournament_deadline,
+                        visible_to_managers=(
+                            manager_visibility
+                            if tournament["status"] not in {"registration", "draw_ready", "archived"}
+                            else False
+                        ),
+                        archive=archive_tournament,
+                    )
+                    st.success("Les réglages du tournoi sont enregistrés.")
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Réglages non enregistrés : {error}")
+
+    elif (
+        current_user_role == "director"
+        and tournament["scope_type"] == "branch"
+        and normalize_email(tournament["owner_email"])
+        == normalize_email(current_user_email)
+    ):
+        with st.expander("⚙️ Réglages de mon tournoi", expanded=False):
+            deadline_value = tournament.get("registration_deadline")
+            try:
+                deadline_value = date.fromisoformat(deadline_value)
+            except (TypeError, ValueError):
+                deadline_value = date.today()
+            with st.form(f"director_tournament_options_{selected_tournament_id}"):
+                edited_tournament_title = st.text_input(
+                    "Titre", value=tournament["title"]
+                )
+                edited_tournament_deadline = st.date_input(
+                    "Date limite d’inscription",
+                    value=deadline_value,
+                    format="DD/MM/YYYY",
+                )
+                save_tournament_options = st.form_submit_button(
+                    "Enregistrer",
+                    use_container_width=True,
+                )
+            if save_tournament_options:
+                try:
+                    update_tournament_options(
+                        database_url,
+                        selected_tournament_id,
+                        current_user_email,
+                        current_user_role,
+                        title=edited_tournament_title,
+                        registration_deadline=edited_tournament_deadline,
+                    )
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Réglages non enregistrés : {error}")
+
+    if tournament["status"] == "registration" and is_tournament_operator:
+        st.subheader("Inscriptions")
+        st.caption(
+            "Collez un pseudo par ligne. Les virgules, points-virgules et "
+            "tabulations sont également reconnus ; les doublons sont bloqués."
+        )
+        with st.form(
+            f"add_tournament_participants_{selected_tournament_id}",
+            clear_on_submit=True,
+        ):
+            participant_batch = st.text_area(
+                "Créateurs à inscrire",
+                height=160,
+                placeholder="createur_1\ncreateur_2\ncreateur_3",
+            )
+            add_tournament_participants = st.form_submit_button(
+                "Ajouter les créateurs",
+                type="primary",
+                use_container_width=True,
+            )
+        if add_tournament_participants:
+            try:
+                parsed_participants = parse_participant_batch(
+                    participant_batch
+                )
+                addition_result = add_participants(
+                    database_url,
+                    selected_tournament_id,
+                    parsed_participants,
+                    current_user_email,
+                    current_user_name,
+                    current_user_role,
+                )
+                if addition_result["duplicates"]:
+                    st.warning(
+                        f"{len(addition_result['duplicates'])} doublon(s) "
+                        "ont été ignorés."
+                    )
+                st.success(
+                    f"{len(addition_result['added'])} créateur(s) ajouté(s)."
+                )
+                st.rerun()
+            except (ValueError, PermissionError) as error:
+                st.warning(str(error))
+            except Exception:
+                st.error("Les inscriptions n’ont pas été enregistrées.")
+
+        if participant_rows:
+            participant_dataframe = pd.DataFrame(participant_rows)
+            st.dataframe(
+                participant_dataframe,
+                use_container_width=True,
+                hide_index=True,
+            )
+            participant_options = {
+                row["id"]: row["name"]
+                for row in tournament["participants"]
+            }
+            with st.form(
+                f"remove_tournament_participant_{selected_tournament_id}"
+            ):
+                participant_to_remove = st.selectbox(
+                    "Retirer un participant",
+                    list(participant_options),
+                    format_func=lambda participant_id: participant_options[participant_id],
+                )
+                confirm_participant_removal = st.checkbox(
+                    "Je confirme le retrait de ce participant"
+                )
+                remove_tournament_participant_button = st.form_submit_button(
+                    "Retirer",
+                    disabled=not confirm_participant_removal,
+                    use_container_width=True,
+                )
+            if remove_tournament_participant_button:
+                try:
+                    remove_participant(
+                        database_url,
+                        selected_tournament_id,
+                        participant_to_remove,
+                        current_user_email,
+                        current_user_role,
+                    )
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Participant non retiré : {error}")
+
+        minimum_participants = 2 if tournament["format"] == "1v1" else 3
+        st.subheader("Préparer le tirage")
+        if not can_finalize_tournament:
+            st.info(
+                "Les inscriptions restent ouvertes. Seul FONDATEUR ADMIN "
+                "validera le tirage du tournoi général."
+            )
+        if tournament["format"] == "2v2":
+            solo_policy_label = st.radio(
+                "Si un créateur reste seul",
+                [
+                    "Le placer en attente d’un partenaire",
+                    "L’autoriser à jouer seul contre un duo",
+                ],
+                key=f"solo_policy_{selected_tournament_id}",
+            )
+            solo_policy = (
+                "waiting"
+                if solo_policy_label.startswith("Le placer")
+                else "solo"
+            )
+            if solo_policy == "waiting":
+                minimum_participants = 4
+        else:
+            solo_policy = "solo"
+            if participant_count % 2:
+                st.info(
+                    "Le tirage créera automatiquement un match à trois avec "
+                    "un seul gagnant."
+                )
+        confirm_draw_creation = st.checkbox(
+            "Je confirme la clôture des inscriptions et la création du tirage",
+            key=f"confirm_draw_{selected_tournament_id}",
+            disabled=not can_finalize_tournament,
+        )
+        if st.button(
+            "🎲 Générer le tirage aléatoire",
+            key=f"prepare_draw_{selected_tournament_id}",
+            type="primary",
+            use_container_width=True,
+            disabled=(
+                participant_count < minimum_participants
+                or not confirm_draw_creation
+                or not can_finalize_tournament
+            ),
+        ):
+            try:
+                finalize_draw(
+                    database_url,
+                    selected_tournament_id,
+                    current_user_email,
+                    current_user_role,
+                    solo_policy=solo_policy,
+                    preview_only=True,
+                )
+                st.rerun()
+            except Exception as error:
+                st.error(f"Le tirage n’a pas été généré : {error}")
+
+    elif participant_rows:
+        with st.expander("👥 Liste des participants", expanded=False):
+            st.dataframe(
+                pd.DataFrame(participant_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    waiting_participant = tournament.get("waiting_participant")
+    if waiting_participant:
+        st.warning(
+            "Créateur actuellement en attente d’un partenaire : "
+            f"**{waiting_participant.get('name', '')}**"
+        )
+
+    if tournament.get("matches"):
+        st.subheader("Tableau du tournoi")
+        round_numbers = sorted(
+            {
+                int(match.get("round_number", 0))
+                for match in tournament["matches"]
+            }
+        )
+        round_tabs = st.tabs(
+            [
+                next(
+                    match.get("round_label", f"Tour {round_number}")
+                    for match in tournament["matches"]
+                    if int(match.get("round_number", 0)) == round_number
+                )
+                for round_number in round_numbers
+            ]
+        )
+        for round_tab, round_number in zip(round_tabs, round_numbers):
+            with round_tab:
+                round_matches = [
+                    match
+                    for match in tournament["matches"]
+                    if int(match.get("round_number", 0)) == round_number
+                ]
+                for match in round_matches:
+                    contestant_labels = [
+                        contestant.get("label", "")
+                        for contestant in match.get("contestants", [])
+                    ]
+                    winner = next(
+                        (
+                            contestant
+                            for contestant in match.get("contestants", [])
+                            if contestant.get("id") == match.get("winner_id")
+                        ),
+                        None,
+                    )
+                    match_title = (
+                        f"Match {match.get('match_number')} • "
+                        + "  VS  ".join(contestant_labels)
+                    )
+                    with st.container(border=True):
+                        st.markdown(f"**{match_title}**")
+                        schedule_text = " • ".join(
+                            value
+                            for value in (
+                                match.get("date", ""),
+                                match.get("time", ""),
+                            )
+                            if value
+                        )
+                        if schedule_text:
+                            st.caption(f"📅 {schedule_text}")
+                        if match.get("bye"):
+                            st.info(
+                                f"Qualification automatique : {contestant_labels[0]}"
+                            )
+                        elif winner:
+                            st.success(f"Gagnant : {winner.get('label', '')}")
+                        else:
+                            st.caption("Résultat en attente")
+
+                        if (
+                            is_tournament_operator
+                            and tournament["status"]
+                            in {"validated", "in_progress", "finished"}
+                            and not match.get("bye")
+                        ):
+                            winner_options = {
+                                contestant.get("id"): contestant.get("label", "")
+                                for contestant in match.get("contestants", [])
+                            }
+                            current_winner_id = match.get("winner_id")
+                            winner_ids = list(winner_options)
+                            winner_index = (
+                                winner_ids.index(current_winner_id)
+                                if current_winner_id in winner_ids
+                                else 0
+                            )
+                            with st.form(
+                                f"winner_form_{selected_tournament_id}_{match['id']}"
+                            ):
+                                selected_winner = st.selectbox(
+                                    "Créateur ou duo gagnant",
+                                    winner_ids,
+                                    index=winner_index,
+                                    format_func=lambda winner_id: winner_options[winner_id],
+                                )
+                                save_winner = st.form_submit_button(
+                                    "Enregistrer le gagnant",
+                                    use_container_width=True,
+                                )
+                            if save_winner:
+                                try:
+                                    status, champion = set_match_winner(
+                                        database_url,
+                                        selected_tournament_id,
+                                        match["id"],
+                                        selected_winner,
+                                        current_user_email,
+                                        current_user_role,
+                                    )
+                                    if champion:
+                                        st.balloons()
+                                    st.rerun()
+                                except Exception as error:
+                                    st.error(f"Résultat non enregistré : {error}")
+
+                        if current_user_role == "admin" and not match.get("bye"):
+                            with st.form(
+                                f"schedule_form_{selected_tournament_id}_{match['id']}"
+                            ):
+                                scheduled_date = st.text_input(
+                                    "Date du match",
+                                    value=match.get("date", ""),
+                                    placeholder="Exemple : 12/09/2026",
+                                )
+                                scheduled_time = st.text_input(
+                                    "Heure du match",
+                                    value=match.get("time", ""),
+                                    placeholder="Exemple : 21H30",
+                                )
+                                save_schedule = st.form_submit_button(
+                                    "Enregistrer date et heure",
+                                    use_container_width=True,
+                                )
+                            if save_schedule:
+                                try:
+                                    update_match_schedule(
+                                        database_url,
+                                        selected_tournament_id,
+                                        match["id"],
+                                        scheduled_date,
+                                        scheduled_time,
+                                        current_user_email,
+                                        current_user_role,
+                                    )
+                                    st.rerun()
+                                except Exception as error:
+                                    st.error(f"Planning non enregistré : {error}")
+
+        if tournament["status"] == "draw_ready" and is_tournament_operator:
+            st.warning(
+                "Le tirage est uniquement en aperçu. Vérifiez tous les duos "
+                "et adversaires avant de le valider."
+            )
+            confirm_final_draw = st.checkbox(
+                "Je confirme définitivement ce tirage",
+                key=f"confirm_final_draw_{selected_tournament_id}",
+            )
+            if st.button(
+                "✅ Valider définitivement le tableau",
+                key=f"validate_draw_{selected_tournament_id}",
+                type="primary",
+                use_container_width=True,
+                disabled=(
+                    not confirm_final_draw or not can_finalize_tournament
+                ),
+            ):
+                try:
+                    validate_prepared_draw(
+                        database_url,
+                        selected_tournament_id,
+                        current_user_email,
+                        current_user_role,
+                    )
+                    st.success("Le tableau du tournoi est maintenant validé.")
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Validation impossible : {error}")
+
+        if tournament["status"] == "finished":
+            final_matches = [
+                match
+                for match in tournament["matches"]
+                if match.get("round_number")
+                == max(row.get("round_number", 0) for row in tournament["matches"])
+            ]
+            final_winner = next(
+                (
+                    contestant.get("label", "")
+                    for match in final_matches
+                    for contestant in match.get("contestants", [])
+                    if contestant.get("id") == match.get("winner_id")
+                ),
+                "",
+            )
+            if final_winner:
+                st.success(f"🏆 VAINQUEUR DU TOURNOI : {final_winner}")
+
+        if match_rows:
+            st.download_button(
+                "⬇️ Télécharger le tournoi (Excel)",
+                data=dataframes_to_excel(
+                    (
+                        ("Participants", pd.DataFrame(participant_rows)),
+                        ("Tableau tournoi", pd.DataFrame(match_rows)),
+                    )
+                ),
+                file_name=(
+                    f"pro_consulting_{safe_export_name(tournament['title'])}.xlsx"
+                ),
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+                key=f"download_tournament_{selected_tournament_id}",
+                use_container_width=True,
+                on_click="ignore",
+            )
+
+    if current_user_role == "admin" and tournament["status"] != "registration":
+        with st.expander("🛡️ Corriger ou recommencer", expanded=False):
+            st.warning(
+                "La réouverture efface uniquement le tirage et les résultats "
+                "de ce tournoi. La liste des inscrits est conservée."
+            )
+            confirm_reopen = st.checkbox(
+                "Je confirme la réouverture des inscriptions",
+                key=f"confirm_reopen_{selected_tournament_id}",
+            )
+            if st.button(
+                "Rouvrir les inscriptions et annuler le tirage",
+                key=f"reopen_tournament_{selected_tournament_id}",
+                use_container_width=True,
+                disabled=not confirm_reopen,
+            ):
+                try:
+                    reopen_registrations(
+                        database_url,
+                        selected_tournament_id,
+                        current_user_email,
+                        current_user_role,
+                    )
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Réouverture impossible : {error}")
 
 
 elif page == "📥 Import Backstage":
