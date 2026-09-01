@@ -29,6 +29,7 @@ from utils import (
 from tournaments import (
     add_participants,
     create_tournament,
+    delete_tournament,
     finalize_draw,
     initialize_tournament_database,
     list_tournaments,
@@ -3333,6 +3334,8 @@ if st.session_state.get("active_user_email") != current_user_email:
     st.session_state.pop("last_rendered_chat_message_id", None)
     st.session_state.pop("last_read_chat_message_id", None)
     st.session_state.pop("handled_chat_deeplink", None)
+    st.session_state.pop("selected_tournament_id", None)
+    st.session_state.pop("tournament_category_view", None)
     st.session_state.active_user_email = current_user_email
 
 persistent_settings_available = database_url is not None
@@ -3860,6 +3863,13 @@ elif page == "🏆 Tournois":
         )
         st.stop()
 
+    tournament_delete_notice = st.session_state.pop(
+        "tournament_delete_notice",
+        None,
+    )
+    if tournament_delete_notice:
+        st.success(tournament_delete_notice)
+
     tournament_status_labels = {
         "registration": "📝 Inscriptions ouvertes",
         "draw_ready": "🎲 Tirage à valider",
@@ -3938,19 +3948,81 @@ elif page == "🏆 Tournois":
         st.error("Les tournois ne peuvent pas être chargés pour le moment.")
         st.stop()
 
-    if not available_tournaments:
+    if current_user_role == "admin":
+        tournament_view = st.radio(
+            "Catégorie de tournois",
+            [
+                "🏢 Tournois de la structure",
+                "👤 Tournois individuels des directeurs",
+                "📚 Tous les tournois",
+            ],
+            horizontal=True,
+            key="tournament_category_view",
+        )
+        if tournament_view.startswith("🏢"):
+            displayed_tournaments = [
+                row
+                for row in available_tournaments
+                if row["scope_type"] == "structure"
+            ]
+        elif tournament_view.startswith("👤"):
+            displayed_tournaments = [
+                row
+                for row in available_tournaments
+                if row["scope_type"] == "branch"
+            ]
+        else:
+            displayed_tournaments = available_tournaments
+    elif current_user_role == "director":
+        tournament_view = st.radio(
+            "Catégorie de tournois",
+            [
+                "🏢 Tournois de la structure",
+                "👤 Mes tournois individuels",
+            ],
+            horizontal=True,
+            key="tournament_category_view",
+        )
+        if tournament_view.startswith("🏢"):
+            displayed_tournaments = [
+                row
+                for row in available_tournaments
+                if row["scope_type"] == "structure"
+            ]
+        else:
+            displayed_tournaments = [
+                row
+                for row in available_tournaments
+                if row["scope_type"] == "branch"
+                and normalize_email(row["owner_email"])
+                == normalize_email(current_user_email)
+            ]
+    else:
+        displayed_tournaments = available_tournaments
+
+    if not displayed_tournaments:
         if current_user_role == "performance_manager":
             st.info(
                 "Aucun tournoi ne vous est actuellement rendu visible par "
                 "FONDATEUR ADMIN."
             )
+        elif current_user_role == "admin" and tournament_view.startswith("👤"):
+            st.info(
+                "Aucun directeur n’a encore créé de tournoi individuel. "
+                "Ils le feront depuis ce même onglet avec leur propre compte."
+            )
+        elif current_user_role == "director" and tournament_view.startswith("👤"):
+            st.info(
+                "Vous n’avez pas encore créé de tournoi individuel pour "
+                "votre branche. Utilisez « Créer un nouveau tournoi » ci-dessus."
+            )
         else:
-            st.info("Aucun tournoi n’a encore été créé.")
+            st.info("Aucun tournoi dans cette catégorie.")
         st.stop()
 
     tournament_by_id = {
         tournament["id"]: tournament
-        for tournament in available_tournaments
+        for tournament in displayed_tournaments
     }
     tournament_ids = list(tournament_by_id)
     selected_tournament_id = st.session_state.get(
@@ -4523,6 +4595,48 @@ elif page == "🏆 Tournois":
                     st.rerun()
                 except Exception as error:
                     st.error(f"Réouverture impossible : {error}")
+
+    if current_user_role == "admin":
+        with st.expander("🗑️ Supprimer définitivement ce tournoi", expanded=False):
+            st.error(
+                "Cette action supprimera uniquement ce tournoi, ses matchs "
+                "et son historique. Elle ne touche à aucune autre donnée du logiciel."
+            )
+            with st.form(
+                f"delete_tournament_form_{selected_tournament_id}"
+            ):
+                deletion_confirmation_text = st.text_input(
+                    "Recopiez exactement le titre du tournoi",
+                    placeholder=tournament["title"],
+                )
+                confirm_tournament_deletion = st.checkbox(
+                    "Je confirme la suppression définitive"
+                )
+                delete_tournament_button = st.form_submit_button(
+                    "Supprimer définitivement le tournoi",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=(
+                        not confirm_tournament_deletion
+                        or deletion_confirmation_text.strip()
+                        != tournament["title"].strip()
+                    ),
+                )
+            if delete_tournament_button:
+                try:
+                    deleted_tournament_title = delete_tournament(
+                        database_url,
+                        selected_tournament_id,
+                        current_user_email,
+                        current_user_role,
+                    )
+                    st.session_state.pop("selected_tournament_id", None)
+                    st.session_state.tournament_delete_notice = (
+                        f"Le tournoi « {deleted_tournament_title} » a été supprimé."
+                    )
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Suppression impossible : {error}")
 
 
 elif page == "📥 Import Backstage":
