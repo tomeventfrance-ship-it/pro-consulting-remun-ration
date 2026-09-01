@@ -84,6 +84,7 @@ def _row_to_tournament(row):
         "participants",
         "competitors",
         "matches",
+        "round_schedule",
         "waiting_participant",
         "draw_token",
         "version",
@@ -96,6 +97,7 @@ def _row_to_tournament(row):
         ("participants", []),
         ("competitors", []),
         ("matches", []),
+        ("round_schedule", []),
         ("waiting_participant", None),
     ):
         tournament[key] = _json_value(tournament[key], fallback)
@@ -109,7 +111,7 @@ TOURNAMENT_SELECT = """
     SELECT
         id, title, format, scope_type, owner_email, owner_name, status,
         registration_deadline, visible_to_managers, solo_policy,
-        participants, competitors, matches, waiting_participant,
+        participants, competitors, matches, round_schedule, waiting_participant,
         draw_token, version, created_at, updated_at, updated_by
     FROM pro_consulting_tournaments
 """
@@ -136,6 +138,7 @@ def initialize_tournament_database(database_url):
                     participants JSONB NOT NULL DEFAULT '[]'::jsonb,
                     competitors JSONB NOT NULL DEFAULT '[]'::jsonb,
                     matches JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    round_schedule JSONB NOT NULL DEFAULT '[]'::jsonb,
                     waiting_participant JSONB,
                     draw_token TEXT,
                     version INTEGER NOT NULL DEFAULT 1,
@@ -143,6 +146,13 @@ def initialize_tournament_database(database_url):
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_by TEXT NOT NULL
                 )
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE pro_consulting_tournaments
+                ADD COLUMN IF NOT EXISTS round_schedule JSONB
+                NOT NULL DEFAULT '[]'::jsonb
                 """
             )
             cursor.execute(
@@ -504,6 +514,47 @@ def build_round(competitors, tournament_format, round_number):
     return matches
 
 
+def build_round_schedule(competitor_count, tournament_format):
+    """Prépare tous les créneaux, du premier tour jusqu'à la finale."""
+    remaining = int(competitor_count or 0)
+    round_number = 1
+    schedule = []
+    while remaining > 1:
+        if tournament_format == "1v1" and remaining % 2 and remaining >= 3:
+            match_count = 1 + (remaining - 3) // 2
+        else:
+            match_count = (remaining + 1) // 2
+        round_label = _round_label(remaining, match_count, round_number)
+        for match_number in range(1, match_count + 1):
+            schedule.append(
+                {
+                    "round_number": round_number,
+                    "round_label": round_label,
+                    "match_number": match_number,
+                    "date": "",
+                    "time": "",
+                }
+            )
+        remaining = match_count
+        round_number += 1
+    return schedule
+
+
+def _apply_round_schedule(matches, round_schedule):
+    slots = {
+        (int(row.get("round_number", 0)), int(row.get("match_number", 0))): row
+        for row in (round_schedule or [])
+    }
+    for match in matches:
+        slot = slots.get(
+            (int(match.get("round_number", 0)), int(match.get("match_number", 0)))
+        )
+        if slot:
+            match["date"] = str(slot.get("date", ""))
+            match["time"] = str(slot.get("time", ""))
+    return matches
+
+
 def finalize_draw(
     database_url,
     tournament_id,
@@ -536,6 +587,10 @@ def finalize_draw(
             if len(competitors) < 2:
                 raise ValueError("Il faut au moins deux equipes pour lancer le tournoi.")
             matches = build_round(competitors, tournament["format"], 1)
+            round_schedule = build_round_schedule(
+                len(competitors), tournament["format"]
+            )
+            matches = _apply_round_schedule(matches, round_schedule)
             draw_token = secrets.token_hex(12)
             target_status = "draw_ready" if preview_only else "validated"
             cursor.execute(
@@ -543,6 +598,7 @@ def finalize_draw(
                 UPDATE pro_consulting_tournaments
                 SET status = %s, solo_policy = %s,
                     competitors = %s::jsonb, matches = %s::jsonb,
+                    round_schedule = %s::jsonb,
                     waiting_participant = %s::jsonb, draw_token = %s,
                     visible_to_managers = FALSE, version = version + 1,
                     updated_at = CURRENT_TIMESTAMP, updated_by = %s
@@ -553,6 +609,7 @@ def finalize_draw(
                     solo_policy,
                     json.dumps(competitors, ensure_ascii=False),
                     json.dumps(matches, ensure_ascii=False),
+                    json.dumps(round_schedule, ensure_ascii=False),
                     json.dumps(waiting_participant, ensure_ascii=False),
                     draw_token,
                     normalize_email(actor_email),
@@ -614,7 +671,7 @@ def _winner_from_match(match):
     )
 
 
-def _advance_if_complete(matches, tournament_format):
+def _advance_if_complete(matches, tournament_format, round_schedule=None):
     current_round = max((row.get("round_number", 0) for row in matches), default=0)
     current_matches = [row for row in matches if row.get("round_number") == current_round]
     if not current_matches or any(not row.get("winner_id") for row in current_matches):
@@ -624,6 +681,7 @@ def _advance_if_complete(matches, tournament_format):
     if len(winners) == 1:
         return matches, "finished", winners[0]
     next_round = build_round(winners, tournament_format, current_round + 1)
+    next_round = _apply_round_schedule(next_round, round_schedule)
     return matches + next_round, "in_progress", None
 
 
@@ -659,7 +717,9 @@ def set_match_winner(
             target["winner_id"] = winner_id
             target["updated_by"] = normalize_email(actor_email)
             target["updated_at"] = _now().isoformat(timespec="seconds")
-            matches, status, champion = _advance_if_complete(matches, tournament["format"])
+            matches, status, champion = _advance_if_complete(
+                matches, tournament["format"], tournament.get("round_schedule", [])
+            )
             cursor.execute(
                 """
                 UPDATE pro_consulting_tournaments
@@ -709,20 +769,99 @@ def update_match_schedule(
                 raise ValueError("Match introuvable.")
             target["date"] = str(match_date or "").strip()[:20]
             target["time"] = str(match_time or "").strip()[:10]
+            round_schedule = [
+                dict(row)
+                for row in (
+                    tournament.get("round_schedule", [])
+                    or build_round_schedule(
+                        len(tournament.get("competitors", [])),
+                        tournament["format"],
+                    )
+                )
+            ]
+            for slot in round_schedule:
+                if (
+                    int(slot.get("round_number", 0))
+                    == int(target.get("round_number", 0))
+                    and int(slot.get("match_number", 0))
+                    == int(target.get("match_number", 0))
+                ):
+                    slot["date"] = target["date"]
+                    slot["time"] = target["time"]
             cursor.execute(
                 """
                 UPDATE pro_consulting_tournaments
-                SET matches = %s::jsonb, version = version + 1,
+                SET matches = %s::jsonb, round_schedule = %s::jsonb,
+                    version = version + 1,
                     updated_at = CURRENT_TIMESTAMP, updated_by = %s
                 WHERE id = %s
                 """,
                 (
                     json.dumps(matches, ensure_ascii=False),
+                    json.dumps(round_schedule, ensure_ascii=False),
                     normalize_email(actor_email),
                     tournament_id,
                 ),
             )
             _audit(cursor, tournament_id, actor_email, "schedule_updated", {"match_id": match_id})
+        connection.commit()
+
+
+def update_round_schedule(
+    database_url,
+    tournament_id,
+    schedule_rows,
+    actor_email,
+    actor_role,
+):
+    """Enregistre en une fois le planning complet, réservé au fondateur."""
+    if actor_role != "admin":
+        raise PermissionError("Le planning complet est reserve au fondateur.")
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            tournament = _load_locked(cursor, tournament_id)
+            blueprint = tournament.get("round_schedule", []) or build_round_schedule(
+                len(tournament.get("competitors", [])), tournament["format"]
+            )
+            allowed = {
+                (int(row.get("round_number", 0)), int(row.get("match_number", 0))): row
+                for row in blueprint
+            }
+            cleaned = []
+            submitted = {
+                (int(row.get("round_number", 0)), int(row.get("match_number", 0))): row
+                for row in (schedule_rows or [])
+            }
+            for key, original in allowed.items():
+                edited = submitted.get(key, {})
+                cleaned.append(
+                    {
+                        "round_number": key[0],
+                        "round_label": original.get("round_label", f"Tour {key[0]}"),
+                        "match_number": key[1],
+                        "date": str(edited.get("date", original.get("date", ""))).strip()[:20],
+                        "time": str(edited.get("time", original.get("time", ""))).strip()[:10],
+                    }
+                )
+            matches = _apply_round_schedule(
+                [dict(row) for row in tournament.get("matches", [])], cleaned
+            )
+            cursor.execute(
+                """
+                UPDATE pro_consulting_tournaments
+                SET round_schedule = %s::jsonb, matches = %s::jsonb,
+                    version = version + 1, updated_at = CURRENT_TIMESTAMP,
+                    updated_by = %s
+                WHERE id = %s
+                """,
+                (
+                    json.dumps(cleaned, ensure_ascii=False),
+                    json.dumps(matches, ensure_ascii=False),
+                    normalize_email(actor_email),
+                    tournament_id,
+                ),
+            )
+            _audit(cursor, tournament_id, actor_email, "full_schedule_updated")
         connection.commit()
 
 
@@ -784,7 +923,8 @@ def reopen_registrations(database_url, tournament_id, actor_email, actor_role):
                 """
                 UPDATE pro_consulting_tournaments
                 SET status = 'registration', competitors = '[]'::jsonb,
-                    matches = '[]'::jsonb, waiting_participant = NULL,
+                    matches = '[]'::jsonb, round_schedule = '[]'::jsonb,
+                    waiting_participant = NULL,
                     draw_token = NULL, visible_to_managers = FALSE,
                     version = version + 1, updated_at = CURRENT_TIMESTAMP,
                     updated_by = %s
