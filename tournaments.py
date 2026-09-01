@@ -796,6 +796,29 @@ def reopen_registrations(database_url, tournament_id, actor_email, actor_role):
         connection.commit()
 
 
+def delete_tournament(
+    database_url,
+    tournament_id,
+    actor_email,
+    actor_role,
+):
+    """Supprime un tournoi et son journal, uniquement pour le fondateur."""
+    if actor_role != "admin":
+        raise PermissionError("Seul le fondateur peut supprimer un tournoi.")
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            tournament = _load_locked(cursor, tournament_id)
+            deleted_title = tournament["title"]
+            cursor.execute(
+                "DELETE FROM pro_consulting_tournaments WHERE id = %s",
+                (tournament_id,),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("La suppression n'a pas ete confirmee.")
+        connection.commit()
+    return deleted_title
+
+
 def tournament_tables(tournament):
     participants = [
         {
