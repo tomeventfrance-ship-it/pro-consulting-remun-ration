@@ -961,6 +961,78 @@ def collaborator_access_scope():
     return "admin:collaborator_access"
 
 
+def payment_preferences_scope(user_email):
+    """Modes de paiement permanents propres à chaque compte."""
+    return f"payment_preferences:{normalize_email(user_email)}"
+
+
+def clean_payment_preferences(payload):
+    """Conserve uniquement les modes reconnus et des clés normalisées."""
+    payload = payload if isinstance(payload, dict) else {}
+
+    def clean_modes(rows):
+        rows = rows if isinstance(rows, dict) else {}
+        return {
+            " ".join(str(name or "").strip().casefold().split()): mode
+            for name, mode in rows.items()
+            if " ".join(str(name or "").strip().casefold().split())
+            and mode in {"Diamants", "Facture €"}
+        }
+
+    director_mode = payload.get("director_mode", "Diamants")
+    if director_mode not in {"Diamants", "Facture €"}:
+        director_mode = "Diamants"
+    return {
+        "consultants": clean_modes(payload.get("consultants")),
+        "responsables": clean_modes(payload.get("responsables")),
+        "directors": clean_modes(payload.get("directors")),
+        "director_mode": director_mode,
+        "saved_at": payload.get("saved_at"),
+    }
+
+
+def payment_entity_key(value):
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def apply_saved_payment_modes(dataframe, entity_column, category):
+    """Réapplique les choix enregistrés après recalcul ou nouvel import."""
+    result = dataframe.copy()
+    saved_modes = st.session_state.get("payment_preferences", {}).get(
+        category,
+        {},
+    )
+    result["Mode paiement"] = result[entity_column].map(
+        lambda value: saved_modes.get(payment_entity_key(value), "Diamants")
+    )
+    return result
+
+
+def persist_payment_preferences(database_url, user_email):
+    """Enregistre la copie nettoyée et confirme la persistance."""
+    preferences = clean_payment_preferences(
+        st.session_state.get("payment_preferences", {})
+    )
+    preferences["saved_at"] = datetime.now(
+        ZoneInfo("Europe/Paris")
+    ).isoformat(timespec="seconds")
+    save_persistent_scopes(
+        database_url,
+        {payment_preferences_scope(user_email): preferences},
+        user_email,
+    )
+    confirmed = clean_payment_preferences(
+        load_persistent_scope(
+            database_url,
+            payment_preferences_scope(user_email),
+        )
+    )
+    if confirmed.get("saved_at") != preferences["saved_at"]:
+        raise RuntimeError("La base n'a pas confirmé les modes de paiement.")
+    st.session_state.payment_preferences = confirmed
+    return confirmed
+
+
 @st.cache_data(ttl=15, show_spinner=False)
 def load_authorization_payloads(database_url):
     """Mémorise brièvement les accès pour accélérer les reruns de widgets."""
@@ -2713,17 +2785,11 @@ def calculate_director_branch_finances(
         minimum_team_diamonds=200_000,
     )
     if not branch_consultants.empty:
-        branch_consultants["Mode paiement"] = "Diamants"
-        if "consultant_results" in st.session_state:
-            saved_consultant_modes = (
-                st.session_state.consultant_results
-                .drop_duplicates("Consultant")
-                .set_index("Consultant")["Mode paiement"]
-                .to_dict()
-            )
-            branch_consultants["Mode paiement"] = branch_consultants[
-                "Consultant"
-            ].map(saved_consultant_modes).fillna("Diamants")
+        branch_consultants = apply_saved_payment_modes(
+            branch_consultants,
+            "Consultant",
+            "consultants",
+        )
         consultant_exclusions = excluded_emails("consultants")
         consultant_excluded_mask = branch_consultants["Consultant"].map(
             lambda value: normalize_email(value) in consultant_exclusions
@@ -2740,17 +2806,11 @@ def calculate_director_branch_finances(
         minimum_group_diamonds=600_000,
     )
     if not branch_responsables.empty:
-        branch_responsables["Mode paiement"] = "Diamants"
-        if "responsable_results" in st.session_state:
-            saved_responsable_modes = (
-                st.session_state.responsable_results
-                .drop_duplicates("Responsable performance")
-                .set_index("Responsable performance")["Mode paiement"]
-                .to_dict()
-            )
-            branch_responsables["Mode paiement"] = branch_responsables[
-                "Responsable performance"
-            ].map(saved_responsable_modes).fillna("Diamants")
+        branch_responsables = apply_saved_payment_modes(
+            branch_responsables,
+            "Responsable performance",
+            "responsables",
+        )
         responsable_exclusions = excluded_emails("responsables")
         responsable_excluded_mask = branch_responsables[
             "Responsable performance"
@@ -3336,6 +3396,10 @@ if st.session_state.get("active_user_email") != current_user_email:
     st.session_state.pop("handled_chat_deeplink", None)
     st.session_state.pop("selected_tournament_id", None)
     st.session_state.pop("tournament_category_view", None)
+    st.session_state.pop("payment_preferences_loaded_for", None)
+    st.session_state.pop("payment_preferences", None)
+    st.session_state.pop("director_payment_mode_selector", None)
+    st.session_state.pop("admin_director_payment_editor", None)
     st.session_state.active_user_email = current_user_email
 
 persistent_settings_available = database_url is not None
@@ -3363,6 +3427,27 @@ if persistent_settings_available:
             "Les valeurs de cette session restent utilisables, mais elles "
             "ne seront pas sauvegardées après la déconnexion."
         )
+
+if (
+    st.session_state.get("payment_preferences_loaded_for")
+    != current_user_email
+):
+    saved_payment_preferences = {}
+    if persistent_settings_available:
+        try:
+            saved_payment_preferences = load_persistent_scope(
+                database_url,
+                payment_preferences_scope(current_user_email),
+            )
+        except Exception:
+            st.sidebar.warning(
+                "Les modes de paiement enregistrés n’ont pas pu être "
+                "chargés pour le moment."
+            )
+    st.session_state.payment_preferences = clean_payment_preferences(
+        saved_payment_preferences
+    )
+    st.session_state.payment_preferences_loaded_for = current_user_email
 
 if persistent_settings_available:
     backstage_session_key = backstage_import_scope(current_user_email)
@@ -5835,7 +5920,11 @@ elif page == "👥 Consultants":
             consultant_level=int(st.session_state.consultant_level),
             minimum_team_diamonds=200_000,
         )
-        consultant_results["Mode paiement"] = "Diamants"
+        consultant_results = apply_saved_payment_modes(
+            consultant_results,
+            "Consultant",
+            "consultants",
+        )
         st.session_state.consultant_results = consultant_results
         st.session_state.consultant_signature = consultant_signature
 
@@ -5908,6 +5997,35 @@ elif page == "👥 Consultants":
     ].values
     consultant_results = financial_columns(consultant_results)
     st.session_state.consultant_results = consultant_results
+
+    if st.button(
+        "💾 Enregistrer les modes de paiement des consultants",
+        key="save_consultant_payment_modes",
+        type="primary",
+        use_container_width=True,
+        disabled=not persistent_settings_available,
+    ):
+        saved_consultant_preferences = dict(
+            st.session_state.payment_preferences.get("consultants", {})
+        )
+        saved_consultant_preferences.update({
+            payment_entity_key(row["Consultant"]): row["Mode paiement"]
+            for row in consultant_results.to_dict("records")
+        })
+        st.session_state.payment_preferences["consultants"] = (
+            saved_consultant_preferences
+        )
+        try:
+            persist_payment_preferences(database_url, current_user_email)
+            st.success(
+                "Les modes de paiement des consultants sont enregistrés "
+                "après déconnexion et changement d’onglet."
+            )
+        except Exception:
+            st.error(
+                "La sauvegarde permanente a échoué. Les choix restent "
+                "visibles uniquement dans cette session."
+            )
 
     diamond_total = consultant_results.loc[
         consultant_results["Mode paiement"] == "Diamants",
@@ -5986,7 +6104,11 @@ elif page == "📈 Responsables performance":
             responsable_level=int(st.session_state.manager_level),
             minimum_group_diamonds=600_000,
         )
-        responsable_results["Mode paiement"] = "Diamants"
+        responsable_results = apply_saved_payment_modes(
+            responsable_results,
+            "Responsable performance",
+            "responsables",
+        )
         st.session_state.responsable_results = responsable_results
         st.session_state.responsable_signature = responsable_signature
 
@@ -6060,6 +6182,37 @@ elif page == "📈 Responsables performance":
     ].values
     responsable_results = financial_columns(responsable_results)
     st.session_state.responsable_results = responsable_results
+
+    if st.button(
+        "💾 Enregistrer les modes de paiement des responsables performance",
+        key="save_responsable_payment_modes",
+        type="primary",
+        use_container_width=True,
+        disabled=not persistent_settings_available,
+    ):
+        saved_responsable_preferences = dict(
+            st.session_state.payment_preferences.get("responsables", {})
+        )
+        saved_responsable_preferences.update({
+            payment_entity_key(row["Responsable performance"]): row[
+                "Mode paiement"
+            ]
+            for row in responsable_results.to_dict("records")
+        })
+        st.session_state.payment_preferences["responsables"] = (
+            saved_responsable_preferences
+        )
+        try:
+            persist_payment_preferences(database_url, current_user_email)
+            st.success(
+                "Les modes de paiement des responsables performance sont "
+                "enregistrés après déconnexion et changement d’onglet."
+            )
+        except Exception:
+            st.error(
+                "La sauvegarde permanente a échoué. Les choix restent "
+                "visibles uniquement dans cette session."
+            )
 
     diamond_total = responsable_results.loc[
         responsable_results["Mode paiement"] == "Diamants",
@@ -6950,6 +7103,18 @@ elif page == "🏢 Directeur de branche":
             director_config=edited_director_config,
             usd_to_eur=director_rate_info["rate"],
         )
+        saved_director_modes = st.session_state.payment_preferences.get(
+            "directors",
+            {},
+        )
+        director_overview["Mode paiement"] = director_overview[
+            "Directeur"
+        ].map(
+            lambda value: saved_director_modes.get(
+                payment_entity_key(value),
+                "Diamants",
+            )
+        )
         st.divider()
         st.subheader("Vue d’ensemble des quatre directeurs")
         overview1, overview2, overview3, overview4 = st.columns(4)
@@ -6967,14 +7132,24 @@ elif page == "🏢 Directeur de branche":
         )
         overview4.metric(
             "Total factures directeurs",
-            f"{director_overview['Montant facture directeur (€)'].sum():,.2f} €",
+            f"{director_overview.loc[director_overview['Mode paiement'] == 'Facture €', 'Montant facture directeur (€)'].sum():,.2f} €",
         )
 
-        st.dataframe(
+        edited_director_overview = st.data_editor(
             director_overview,
             use_container_width=True,
             hide_index=True,
+            disabled=[
+                column
+                for column in director_overview.columns
+                if column != "Mode paiement"
+            ],
             column_config={
+                "Mode paiement": st.column_config.SelectboxColumn(
+                    "Mode paiement",
+                    options=["Diamants", "Facture €"],
+                    required=True,
+                ),
                 "Diamants générés": st.column_config.NumberColumn(
                     format="%.0f 💎"
                 ),
@@ -7012,7 +7187,33 @@ elif page == "🏢 Directeur de branche":
                     format="%.2f €"
                 ),
             },
+            key="admin_director_payment_editor",
         )
+        if st.button(
+            "💾 Enregistrer les modes de paiement des directeurs",
+            key="save_admin_director_payment_modes",
+            type="primary",
+            use_container_width=True,
+            disabled=not persistent_settings_available,
+        ):
+            st.session_state.payment_preferences["directors"] = {
+                payment_entity_key(row["Directeur"]): row["Mode paiement"]
+                for row in edited_director_overview.to_dict("records")
+            }
+            try:
+                persist_payment_preferences(
+                    database_url,
+                    current_user_email,
+                )
+                st.success(
+                    "Les modes de paiement des directeurs sont enregistrés "
+                    "après déconnexion et changement d’onglet."
+                )
+            except Exception:
+                st.error(
+                    "La sauvegarde permanente des modes directeurs a échoué."
+                )
+        director_overview = edited_director_overview
         show_excel_download(
             director_overview,
             table_name="factures_quatre_directeurs",
@@ -7126,17 +7327,11 @@ elif page == "🏢 Directeur de branche":
         minimum_team_diamonds=200_000,
     )
     if not branch_consultants.empty:
-        branch_consultants["Mode paiement"] = "Diamants"
-        if "consultant_results" in st.session_state:
-            saved_consultant_modes = (
-                st.session_state.consultant_results
-                .drop_duplicates("Consultant")
-                .set_index("Consultant")["Mode paiement"]
-                .to_dict()
-            )
-            branch_consultants["Mode paiement"] = branch_consultants[
-                "Consultant"
-            ].map(saved_consultant_modes).fillna("Diamants")
+        branch_consultants = apply_saved_payment_modes(
+            branch_consultants,
+            "Consultant",
+            "consultants",
+        )
         consultant_exclusions = excluded_emails("consultants")
         consultant_excluded_mask = branch_consultants["Consultant"].map(
             lambda value: normalize_email(value) in consultant_exclusions
@@ -7153,17 +7348,11 @@ elif page == "🏢 Directeur de branche":
         minimum_group_diamonds=600_000,
     )
     if not branch_responsables.empty:
-        branch_responsables["Mode paiement"] = "Diamants"
-        if "responsable_results" in st.session_state:
-            saved_responsable_modes = (
-                st.session_state.responsable_results
-                .drop_duplicates("Responsable performance")
-                .set_index("Responsable performance")["Mode paiement"]
-                .to_dict()
-            )
-            branch_responsables["Mode paiement"] = branch_responsables[
-                "Responsable performance"
-            ].map(saved_responsable_modes).fillna("Diamants")
+        branch_responsables = apply_saved_payment_modes(
+            branch_responsables,
+            "Responsable performance",
+            "responsables",
+        )
         responsable_exclusions = excluded_emails("responsables")
         responsable_excluded_mask = branch_responsables[
             "Responsable performance"
@@ -7205,6 +7394,53 @@ elif page == "🏢 Directeur de branche":
         net_profit_before_director - director_reward
     )
 
+    st.subheader("Mode de paiement du directeur")
+    saved_director_payment_mode = st.session_state.payment_preferences.get(
+        "director_mode",
+        "Diamants",
+    )
+    director_payment_mode = st.selectbox(
+        "Choisissez le mode de paiement",
+        ["Diamants", "Facture €"],
+        index=(0 if saved_director_payment_mode == "Diamants" else 1),
+        key="director_payment_mode_selector",
+    )
+    if st.button(
+        "💾 Enregistrer le mode de paiement du directeur",
+        key="save_director_payment_mode",
+        type="primary",
+        use_container_width=True,
+        disabled=not persistent_settings_available,
+    ):
+        st.session_state.payment_preferences["director_mode"] = (
+            director_payment_mode
+        )
+        try:
+            persist_payment_preferences(database_url, current_user_email)
+            st.success(
+                "Le mode de paiement du directeur est enregistré après "
+                "déconnexion et changement d’onglet."
+            )
+        except Exception:
+            st.error(
+                "La sauvegarde permanente a échoué. Le choix reste visible "
+                "uniquement dans cette session."
+            )
+
+    director_diamond_unit_cost = float(
+        st.session_state.coin_pack_price
+    ) / 1000
+    director_reward_diamonds = (
+        floor_to_hundred(director_reward / director_diamond_unit_cost)
+        if director_diamond_unit_cost > 0
+        else 0
+    )
+    director_reward_display = (
+        f"{director_reward_diamonds:,.0f} 💎"
+        if director_payment_mode == "Diamants"
+        else f"{director_reward:,.2f} €"
+    )
+
     st.divider()
     st.subheader("Résultat de la branche")
     result1, result2, result3, result4 = st.columns(4)
@@ -7219,7 +7455,11 @@ elif page == "🏢 Directeur de branche":
     )
     result4.metric(
         f"Rémunération directeur ({director_rate * 100:.0f} %)",
-        f"{director_reward:,.2f} €",
+        director_reward_display,
+    )
+    st.caption(
+        f"Mode enregistré : {director_payment_mode}. Valeur de coût prise "
+        f"en compte dans le bénéfice : {director_reward:,.2f} €."
     )
 
     summary = pd.DataFrame(
@@ -7383,17 +7623,11 @@ elif page == "💰 Bénéfice agence":
         minimum_team_diamonds=200_000,
     )
     if not agency_consultants.empty:
-        agency_consultants["Mode paiement"] = "Diamants"
-        if "consultant_results" in st.session_state:
-            saved_consultant_modes = (
-                st.session_state.consultant_results
-                .drop_duplicates("Consultant")
-                .set_index("Consultant")["Mode paiement"]
-                .to_dict()
-            )
-            agency_consultants["Mode paiement"] = agency_consultants[
-                "Consultant"
-            ].map(saved_consultant_modes).fillna("Diamants")
+        agency_consultants = apply_saved_payment_modes(
+            agency_consultants,
+            "Consultant",
+            "consultants",
+        )
 
         consultant_exclusions = excluded_emails("consultants")
         consultant_excluded_mask = agency_consultants["Consultant"].map(
@@ -7411,17 +7645,11 @@ elif page == "💰 Bénéfice agence":
         minimum_group_diamonds=600_000,
     )
     if not agency_responsables.empty:
-        agency_responsables["Mode paiement"] = "Diamants"
-        if "responsable_results" in st.session_state:
-            saved_responsable_modes = (
-                st.session_state.responsable_results
-                .drop_duplicates("Responsable performance")
-                .set_index("Responsable performance")["Mode paiement"]
-                .to_dict()
-            )
-            agency_responsables["Mode paiement"] = agency_responsables[
-                "Responsable performance"
-            ].map(saved_responsable_modes).fillna("Diamants")
+        agency_responsables = apply_saved_payment_modes(
+            agency_responsables,
+            "Responsable performance",
+            "responsables",
+        )
 
         responsable_exclusions = excluded_emails("responsables")
         responsable_excluded_mask = agency_responsables[
