@@ -70,6 +70,10 @@ def _json_value(value, fallback):
 def _row_to_tournament(row):
     if row is None:
         return None
+    # Les requêtes de liste utilisent volontairement le schéma historique
+    # afin qu'une migration de planning retardée ne bloque jamais l'onglet.
+    if len(row) == 19:
+        row = tuple(row[:13]) + ([],) + tuple(row[13:])
     columns = (
         "id",
         "title",
@@ -117,6 +121,16 @@ TOURNAMENT_SELECT = """
             '[]'::jsonb
         ) AS round_schedule,
         waiting_participant,
+        draw_token, version, created_at, updated_at, updated_by
+    FROM pro_consulting_tournaments
+"""
+
+
+TOURNAMENT_LIST_SELECT = """
+    SELECT
+        id, title, format, scope_type, owner_email, owner_name, status,
+        registration_deadline, visible_to_managers, solo_policy,
+        participants, competitors, matches, waiting_participant,
         draw_token, version, created_at, updated_at, updated_by
     FROM pro_consulting_tournaments
 """
@@ -253,7 +267,9 @@ def _can_finalize(tournament, user_email, user_role):
 def list_tournaments(database_url, user_email, user_role):
     with psycopg.connect(database_url) as connection:
         with connection.cursor() as cursor:
-            cursor.execute(TOURNAMENT_SELECT + " ORDER BY updated_at DESC")
+            cursor.execute(
+                TOURNAMENT_LIST_SELECT + " ORDER BY updated_at DESC"
+            )
             rows = cursor.fetchall()
     tournaments = [_row_to_tournament(row) for row in rows]
     return [
