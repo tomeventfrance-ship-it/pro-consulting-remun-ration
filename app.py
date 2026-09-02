@@ -4818,59 +4818,61 @@ elif page == "🏆 Tournois":
                     st.error(f"Réouverture impossible : {error}")
 
     if current_user_role == "admin":
-        with st.expander("🗑️ Supprimer définitivement ce tournoi", expanded=False):
+        with st.expander("🗑️ Supprimer un tournoi", expanded=False):
             st.error(
-                "Cette action supprimera uniquement ce tournoi, ses matchs "
-                "et son historique. Elle ne touche à aucune autre donnée du logiciel."
+                "Sélectionnez précisément le tournoi à supprimer. Il sera "
+                "retiré de toutes les listes, avec ses matchs et son historique, "
+                "sans toucher aux autres données du logiciel."
             )
-            with st.form(
-                f"delete_tournament_form_{selected_tournament_id}"
-            ):
-                deletion_confirmation_text = st.text_input(
-                    "Recopiez le titre du tournoi",
-                    placeholder=tournament["title"],
-                    help=(
-                        "Les majuscules et les espaces supplémentaires "
-                        "n’empêchent pas la confirmation."
-                    ),
+            deletion_tournaments_by_id = {
+                row["id"]: row for row in available_tournaments
+            }
+
+            def tournament_deletion_label(tournament_id):
+                row = deletion_tournaments_by_id[tournament_id]
+                owner_label = (
+                    "Structure"
+                    if row["scope_type"] == "structure"
+                    else row.get("owner_name", "Direction")
+                )
+                return (
+                    f"{row['title']} • {row['format']} • {owner_label} • "
+                    f"{tournament_status_labels.get(row['status'], row['status'])} "
+                    f"• réf. {str(tournament_id)[:6].upper()}"
+                )
+
+            with st.form("delete_tournament_global_form"):
+                tournament_to_delete = st.selectbox(
+                    "Tournoi à supprimer",
+                    list(deletion_tournaments_by_id),
+                    format_func=tournament_deletion_label,
                 )
                 confirm_tournament_deletion = st.checkbox(
-                    "Je confirme la suppression définitive"
+                    "Je confirme la suppression définitive du tournoi sélectionné"
                 )
                 delete_tournament_button = st.form_submit_button(
-                    "Supprimer définitivement le tournoi",
+                    "Supprimer le tournoi sélectionné",
                     type="primary",
                     use_container_width=True,
                 )
             if delete_tournament_button:
-                entered_title = " ".join(
-                    deletion_confirmation_text.split()
-                ).casefold()
-                expected_title = " ".join(
-                    tournament["title"].split()
-                ).casefold()
                 if not confirm_tournament_deletion:
                     st.warning(
                         "Cochez la confirmation avant de supprimer le tournoi."
-                    )
-                elif entered_title != expected_title:
-                    st.warning(
-                        "Le titre saisi ne correspond pas au titre du tournoi."
                     )
                 else:
                     try:
                         deleted_tournament_title = delete_tournament(
                             database_url,
-                            selected_tournament_id,
+                            tournament_to_delete,
                             current_user_email,
                             current_user_role,
                         )
                         st.session_state.pop("selected_tournament_id", None)
                         st.session_state.tournament_delete_notice = (
                             f"Le tournoi « {deleted_tournament_title} » "
-                            f"(réf. {selected_tournament_id[:6].upper()}) a bien "
-                            "été supprimé. Les éventuels tournois portant le "
-                            "même titre restent indépendants."
+                            f"(réf. {tournament_to_delete[:6].upper()}) a été "
+                            "supprimé de toutes les listes."
                         )
                         st.rerun()
                     except Exception as error:
