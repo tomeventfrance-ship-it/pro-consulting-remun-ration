@@ -4818,8 +4818,12 @@ elif page == "🏆 Tournois":
                 f"delete_tournament_form_{selected_tournament_id}"
             ):
                 deletion_confirmation_text = st.text_input(
-                    "Recopiez exactement le titre du tournoi",
+                    "Recopiez le titre du tournoi",
                     placeholder=tournament["title"],
+                    help=(
+                        "Les majuscules et les espaces supplémentaires "
+                        "n’empêchent pas la confirmation."
+                    ),
                 )
                 confirm_tournament_deletion = st.checkbox(
                     "Je confirme la suppression définitive"
@@ -4828,27 +4832,37 @@ elif page == "🏆 Tournois":
                     "Supprimer définitivement le tournoi",
                     type="primary",
                     use_container_width=True,
-                    disabled=(
-                        not confirm_tournament_deletion
-                        or deletion_confirmation_text.strip()
-                        != tournament["title"].strip()
-                    ),
                 )
             if delete_tournament_button:
-                try:
-                    deleted_tournament_title = delete_tournament(
-                        database_url,
-                        selected_tournament_id,
-                        current_user_email,
-                        current_user_role,
+                entered_title = " ".join(
+                    deletion_confirmation_text.split()
+                ).casefold()
+                expected_title = " ".join(
+                    tournament["title"].split()
+                ).casefold()
+                if not confirm_tournament_deletion:
+                    st.warning(
+                        "Cochez la confirmation avant de supprimer le tournoi."
                     )
-                    st.session_state.pop("selected_tournament_id", None)
-                    st.session_state.tournament_delete_notice = (
-                        f"Le tournoi « {deleted_tournament_title} » a été supprimé."
+                elif entered_title != expected_title:
+                    st.warning(
+                        "Le titre saisi ne correspond pas au titre du tournoi."
                     )
-                    st.rerun()
-                except Exception as error:
-                    st.error(f"Suppression impossible : {error}")
+                else:
+                    try:
+                        deleted_tournament_title = delete_tournament(
+                            database_url,
+                            selected_tournament_id,
+                            current_user_email,
+                            current_user_role,
+                        )
+                        st.session_state.pop("selected_tournament_id", None)
+                        st.session_state.tournament_delete_notice = (
+                            f"Le tournoi « {deleted_tournament_title} » a été supprimé."
+                        )
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"Suppression impossible : {error}")
 
 
 elif page == "📥 Import Backstage":
