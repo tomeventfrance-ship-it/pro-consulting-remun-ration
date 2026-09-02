@@ -4156,6 +4156,19 @@ elif page == "🏆 Tournois":
         tournament["id"]: tournament
         for tournament in displayed_tournaments
     }
+
+    def tournament_selection_label(tournament_id):
+        tournament_row = tournament_by_id[tournament_id]
+        created_at = str(tournament_row.get("created_at", ""))
+        created_label = created_at[:16].replace("T", " ")
+        reference = str(tournament_id)[:6].upper()
+        identity_suffix = f" • créé {created_label}" if created_label else ""
+        return (
+            f"{tournament_row['title']} • {tournament_row['format']} • "
+            f"{tournament_status_labels.get(tournament_row['status'], tournament_row['status'])} "
+            f"• réf. {reference}{identity_suffix}"
+        )
+
     tournament_ids = list(tournament_by_id)
     selected_tournament_id = st.session_state.get(
         "selected_tournament_id"
@@ -4167,11 +4180,7 @@ elif page == "🏆 Tournois":
         "Tournoi affiché",
         tournament_ids,
         index=tournament_ids.index(selected_tournament_id),
-        format_func=lambda tournament_id: (
-            f"{tournament_by_id[tournament_id]['title']} • "
-            f"{tournament_by_id[tournament_id]['format']} • "
-            f"{tournament_status_labels.get(tournament_by_id[tournament_id]['status'], tournament_by_id[tournament_id]['status'])}"
-        ),
+        format_func=tournament_selection_label,
         key="selected_tournament_id",
     )
     try:
@@ -4858,7 +4867,10 @@ elif page == "🏆 Tournois":
                         )
                         st.session_state.pop("selected_tournament_id", None)
                         st.session_state.tournament_delete_notice = (
-                            f"Le tournoi « {deleted_tournament_title} » a été supprimé."
+                            f"Le tournoi « {deleted_tournament_title} » "
+                            f"(réf. {selected_tournament_id[:6].upper()}) a bien "
+                            "été supprimé. Les éventuels tournois portant le "
+                            "même titre restent indépendants."
                         )
                         st.rerun()
                     except Exception as error:
