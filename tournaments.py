@@ -111,7 +111,12 @@ TOURNAMENT_SELECT = """
     SELECT
         id, title, format, scope_type, owner_email, owner_name, status,
         registration_deadline, visible_to_managers, solo_policy,
-        participants, competitors, matches, round_schedule, waiting_participant,
+        participants, competitors, matches,
+        COALESCE(
+            to_jsonb(pro_consulting_tournaments) -> 'round_schedule',
+            '[]'::jsonb
+        ) AS round_schedule,
+        waiting_participant,
         draw_token, version, created_at, updated_at, updated_by
     FROM pro_consulting_tournaments
 """
