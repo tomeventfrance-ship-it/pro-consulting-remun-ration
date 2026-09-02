@@ -7366,7 +7366,7 @@ elif page == "🏢 Directeur de branche":
         )
         director_overview["Montant facture (€)"] = director_overview[
             "Montant facture directeur (€)"
-        ].where(director_overview["Mode paiement"] == "Facture €", 0.0)
+        ]
         st.divider()
         st.subheader("Vue d’ensemble des quatre directeurs")
         overview1, overview2, overview3, overview4 = st.columns(4)
@@ -7384,7 +7384,7 @@ elif page == "🏢 Directeur de branche":
         )
         overview4.metric(
             "Total factures directeurs",
-            f"{director_overview['Montant facture (€)'].sum():,.2f} €",
+            f"{director_overview.loc[director_overview['Mode paiement'] == 'Facture €', 'Montant facture (€)'].sum():,.2f} €",
         )
 
         edited_director_overview = st.data_editor(
@@ -7471,7 +7471,7 @@ elif page == "🏢 Directeur de branche":
         director_overview = edited_director_overview
         director_overview["Montant facture (€)"] = director_overview[
             "Montant facture directeur (€)"
-        ].where(director_overview["Mode paiement"] == "Facture €", 0.0)
+        ]
         show_excel_download(
             director_overview,
             table_name="factures_quatre_directeurs",
@@ -7732,8 +7732,6 @@ elif page == "🏢 Directeur de branche":
                 ),
                 "Montant facture (€)": (
                     round(director_reward, 2)
-                    if director_payment_mode == "Facture €"
-                    else 0.0
                 ),
             }
         ]
