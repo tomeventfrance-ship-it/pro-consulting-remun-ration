@@ -1021,6 +1021,7 @@ def clean_payment_preferences(payload):
     if director_mode not in {"Diamants", "Facture €"}:
         director_mode = "Diamants"
     return {
+        "creators": clean_modes(payload.get("creators")),
         "consultants": clean_modes(payload.get("consultants")),
         "responsables": clean_modes(payload.get("responsables")),
         "directors": clean_modes(payload.get("directors")),
@@ -2668,6 +2669,15 @@ def financial_columns(dataframe):
     result["Total déduction €"] = (
         result["Facture €"] + result["Coût diamants €"]
     )
+    return result
+
+
+def add_invoice_amount_column(dataframe):
+    """Ajoute en dernière position le montant réellement à facturer."""
+    result = dataframe.copy()
+    if "Montant facture (€)" in result.columns:
+        result.pop("Montant facture (€)")
+    result["Montant facture (€)"] = result.get("Facture €", 0)
     return result
 
 
@@ -5941,7 +5951,9 @@ elif page == "💎 Créateurs":
             "Rémunération 💎"
         ]
         creator_results["Inclure rémunération créateur"] = "Oui"
-        creator_results["Mode paiement"] = "Diamants"
+        creator_results = apply_saved_payment_modes(
+            creator_results, "Pseudo", "creators"
+        )
         st.session_state.creator_results = creator_results
         st.session_state.creator_signature = creator_signature
 
@@ -5955,7 +5967,10 @@ elif page == "💎 Créateurs":
         creator_results["Inclure rémunération créateur"] = "Oui"
 
     st.divider()
-    payment_table = creator_results[
+    payment_source = add_invoice_amount_column(
+        financial_columns(creator_results)
+    )
+    payment_table = payment_source[
         [
             "Pseudo",
             "Groupe",
@@ -5964,6 +5979,7 @@ elif page == "💎 Créateurs":
             "Inclure rémunération créateur",
             "Rémunération 💎",
             "Mode paiement",
+            "Montant facture (€)",
         ]
     ].copy()
 
@@ -5977,6 +5993,7 @@ elif page == "💎 Créateurs":
             "Agent",
             "Diamants",
             "Rémunération 💎",
+            "Montant facture (€)",
         ],
         column_config={
             "Inclure rémunération créateur": (
@@ -5995,7 +6012,10 @@ elif page == "💎 Créateurs":
                 "Mode paiement",
                 options=["Diamants", "Facture €"],
                 required=True,
-            )
+            ),
+            "Montant facture (€)": st.column_config.NumberColumn(
+                "Montant facture (€)", format="%.0f €"
+            ),
         },
         key="creator_payment_editor",
     )
@@ -6019,7 +6039,34 @@ elif page == "💎 Créateurs":
         0,
     )
     creator_results = financial_columns(creator_results)
+    creator_results = add_invoice_amount_column(creator_results)
     st.session_state.creator_results = creator_results
+
+    if st.button(
+        "💾 Enregistrer les modes de paiement des créateurs",
+        key="save_creator_payment_modes",
+        type="primary",
+        use_container_width=True,
+        disabled=not persistent_settings_available,
+    ):
+        saved_creator_preferences = dict(
+            st.session_state.payment_preferences.get("creators", {})
+        )
+        saved_creator_preferences.update({
+            payment_entity_key(row["Pseudo"]): row["Mode paiement"]
+            for row in creator_results.to_dict("records")
+        })
+        st.session_state.payment_preferences["creators"] = (
+            saved_creator_preferences
+        )
+        try:
+            persist_payment_preferences(database_url, current_user_email)
+            st.success(
+                "Les modes de paiement des créateurs sont enregistrés "
+                "après déconnexion et changement d’onglet."
+            )
+        except Exception:
+            st.error("La sauvegarde permanente des modes créateurs a échoué.")
 
     diamond_total = creator_results.loc[
         creator_results["Mode paiement"] == "Diamants",
@@ -6076,7 +6123,9 @@ elif page == "👥 Consultants":
             st.session_state.backstage_data,
             int(st.session_state.creator_level),
         )
-        creator_results["Mode paiement"] = "Diamants"
+        creator_results = apply_saved_payment_modes(
+            creator_results, "Pseudo", "creators"
+        )
         st.session_state.creator_results = creator_results
         st.session_state.creator_signature = creator_signature
 
@@ -6126,6 +6175,8 @@ elif page == "👥 Consultants":
     ] = 0
 
     st.divider()
+    consultant_results = financial_columns(consultant_results)
+    consultant_results = add_invoice_amount_column(consultant_results)
     payment_table = consultant_results[
         [
             "Consultant",
@@ -6137,6 +6188,7 @@ elif page == "👥 Consultants":
             "Taux",
             "Rémunération 💎",
             "Mode paiement",
+            "Montant facture (€)",
         ]
     ].copy()
 
@@ -6153,13 +6205,17 @@ elif page == "👥 Consultants":
             "Seuil atteint",
             "Taux",
             "Rémunération 💎",
+            "Montant facture (€)",
         ],
         column_config={
             "Mode paiement": st.column_config.SelectboxColumn(
                 "Mode paiement",
                 options=["Diamants", "Facture €"],
                 required=True,
-            )
+            ),
+            "Montant facture (€)": st.column_config.NumberColumn(
+                "Montant facture (€)", format="%.0f €"
+            ),
         },
         key="consultant_payment_editor",
     )
@@ -6174,6 +6230,7 @@ elif page == "👥 Consultants":
         "Mode paiement"
     ].values
     consultant_results = financial_columns(consultant_results)
+    consultant_results = add_invoice_amount_column(consultant_results)
     st.session_state.consultant_results = consultant_results
 
     if st.button(
@@ -6260,7 +6317,9 @@ elif page == "📈 Responsables performance":
             st.session_state.backstage_data,
             int(st.session_state.creator_level),
         )
-        creator_results["Mode paiement"] = "Diamants"
+        creator_results = apply_saved_payment_modes(
+            creator_results, "Pseudo", "creators"
+        )
         st.session_state.creator_results = creator_results
         st.session_state.creator_signature = creator_signature
 
@@ -6311,6 +6370,8 @@ elif page == "📈 Responsables performance":
     ] = 0
 
     st.divider()
+    responsable_results = financial_columns(responsable_results)
+    responsable_results = add_invoice_amount_column(responsable_results)
     payment_table = responsable_results[
         [
             "Responsable performance",
@@ -6322,6 +6383,7 @@ elif page == "📈 Responsables performance":
             "Taux",
             "Rémunération 💎",
             "Mode paiement",
+            "Montant facture (€)",
         ]
     ].copy()
 
@@ -6338,13 +6400,17 @@ elif page == "📈 Responsables performance":
             "Seuil atteint",
             "Taux",
             "Rémunération 💎",
+            "Montant facture (€)",
         ],
         column_config={
             "Mode paiement": st.column_config.SelectboxColumn(
                 "Mode paiement",
                 options=["Diamants", "Facture €"],
                 required=True,
-            )
+            ),
+            "Montant facture (€)": st.column_config.NumberColumn(
+                "Montant facture (€)", format="%.0f €"
+            ),
         },
         key="responsable_payment_editor",
     )
@@ -6359,6 +6425,7 @@ elif page == "📈 Responsables performance":
         "Mode paiement"
     ].values
     responsable_results = financial_columns(responsable_results)
+    responsable_results = add_invoice_amount_column(responsable_results)
     st.session_state.responsable_results = responsable_results
 
     if st.button(
@@ -6500,7 +6567,9 @@ elif page == "🎁 Suivi récompenses":
                 "Rémunération 💎"
             ]
             creator_results["Inclure rémunération créateur"] = "Oui"
-            creator_results["Mode paiement"] = "Diamants"
+            creator_results = apply_saved_payment_modes(
+                creator_results, "Pseudo", "creators"
+            )
             st.session_state.creator_results = creator_results
             st.session_state.creator_signature = creator_signature
 
@@ -7089,7 +7158,9 @@ elif page == "🏢 Directeur de branche":
             st.session_state.backstage_data,
             int(st.session_state.creator_level),
         )
-        creator_results["Mode paiement"] = "Diamants"
+        creator_results = apply_saved_payment_modes(
+            creator_results, "Pseudo", "creators"
+        )
         st.session_state.creator_results = creator_results
         st.session_state.creator_signature = creator_signature
 
@@ -7293,6 +7364,9 @@ elif page == "🏢 Directeur de branche":
                 "Diamants",
             )
         )
+        director_overview["Montant facture (€)"] = director_overview[
+            "Montant facture directeur (€)"
+        ].where(director_overview["Mode paiement"] == "Facture €", 0.0)
         st.divider()
         st.subheader("Vue d’ensemble des quatre directeurs")
         overview1, overview2, overview3, overview4 = st.columns(4)
@@ -7310,7 +7384,7 @@ elif page == "🏢 Directeur de branche":
         )
         overview4.metric(
             "Total factures directeurs",
-            f"{director_overview.loc[director_overview['Mode paiement'] == 'Facture €', 'Montant facture directeur (€)'].sum():,.2f} €",
+            f"{director_overview['Montant facture (€)'].sum():,.2f} €",
         )
 
         edited_director_overview = st.data_editor(
@@ -7361,6 +7435,9 @@ elif page == "🏢 Directeur de branche":
                 "Montant facture directeur (€)": (
                     st.column_config.NumberColumn(format="%.2f €")
                 ),
+                "Montant facture (€)": (
+                    st.column_config.NumberColumn(format="%.2f €")
+                ),
                 "Bénéfice restant (€)": st.column_config.NumberColumn(
                     format="%.2f €"
                 ),
@@ -7392,6 +7469,9 @@ elif page == "🏢 Directeur de branche":
                     "La sauvegarde permanente des modes directeurs a échoué."
                 )
         director_overview = edited_director_overview
+        director_overview["Montant facture (€)"] = director_overview[
+            "Montant facture directeur (€)"
+        ].where(director_overview["Mode paiement"] == "Facture €", 0.0)
         show_excel_download(
             director_overview,
             table_name="factures_quatre_directeurs",
@@ -7640,6 +7720,34 @@ elif page == "🏢 Directeur de branche":
         f"en compte dans le bénéfice : {director_reward:,.2f} €."
     )
 
+    director_payment_reference = pd.DataFrame(
+        [
+            {
+                "Directeur": current_user_name,
+                "Mode paiement": director_payment_mode,
+                "Rémunération 💎": (
+                    director_reward_diamonds
+                    if director_payment_mode == "Diamants"
+                    else 0
+                ),
+                "Montant facture (€)": (
+                    round(director_reward, 2)
+                    if director_payment_mode == "Facture €"
+                    else 0.0
+                ),
+            }
+        ]
+    )
+    st.dataframe(
+        director_payment_reference,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Rémunération 💎": st.column_config.NumberColumn(format="%.0f 💎"),
+            "Montant facture (€)": st.column_config.NumberColumn(format="%.2f €"),
+        },
+    )
+
     summary = pd.DataFrame(
         [
             ("Chiffre d’affaires converti", revenue_eur),
@@ -7786,7 +7894,9 @@ elif page == "💰 Bénéfice agence":
             st.session_state.backstage_data,
             int(st.session_state.creator_level),
         )
-        creator_results["Mode paiement"] = "Diamants"
+        creator_results = apply_saved_payment_modes(
+            creator_results, "Pseudo", "creators"
+        )
         st.session_state.creator_results = creator_results
         st.session_state.creator_signature = creator_signature
 
