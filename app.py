@@ -26,7 +26,7 @@ from utils import (
     calculate_creator_rewards,
     prepare_backstage_data,
 )
-from tournaments import (
+from tournaments_v2 import (
     add_participants,
     build_round_schedule,
     create_tournament,
