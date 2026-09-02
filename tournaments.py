@@ -265,6 +265,9 @@ def _can_finalize(tournament, user_email, user_role):
 
 
 def list_tournaments(database_url, user_email, user_role):
+    # Streamlit peut recharger le code en conservant une ancienne session :
+    # la migration doit donc être garantie ici, avant toute lecture.
+    initialize_tournament_database(database_url)
     with psycopg.connect(database_url) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
