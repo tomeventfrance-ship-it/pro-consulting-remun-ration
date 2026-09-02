@@ -4074,8 +4074,10 @@ elif page == "🏆 Tournois":
             current_user_email,
             current_user_role,
         )
-    except Exception:
+    except Exception as error:
         st.error("Les tournois ne peuvent pas être chargés pour le moment.")
+        with st.expander("Afficher le détail technique"):
+            st.code(f"{type(error).__name__}: {error}")
         st.stop()
 
     if current_user_role == "admin":
