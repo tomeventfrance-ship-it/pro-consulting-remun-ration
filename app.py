@@ -3243,7 +3243,20 @@ def clean_director_management_config(payload, available_groups):
 
 def normalize_group_name(value):
     """Normalise un nom de groupe pour un contrôle fiable des imports."""
-    return " ".join(str(value or "").strip().casefold().split())
+    normalized = unicodedata.normalize(
+        "NFKC",
+        str(value or "").replace("\u00a0", " "),
+    ).strip().casefold()
+    # Backstage et les listes d'accès peuvent écrire différemment les
+    # espaces autour des séparateurs sans que le groupe soit différent.
+    normalized = re.sub(r"\s*([/|&+_-])\s*", r"\1", normalized)
+    normalized = re.sub(
+        r"^(?:groupe|manager|responsable performance)\s*[:\-]?\s*",
+        "",
+        normalized,
+    )
+    normalized = re.sub(r"[^\w]+", " ", normalized, flags=re.UNICODE)
+    return " ".join(normalized.split())
 
 
 def validate_director_import_groups(
