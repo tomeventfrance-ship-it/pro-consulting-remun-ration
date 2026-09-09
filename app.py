@@ -1,4 +1,5 @@
 import base64
+import importlib
 import json
 import hashlib
 import re
@@ -26,6 +27,13 @@ from utils import (
     calculate_creator_rewards,
     prepare_backstage_data,
 )
+import tournaments_v2 as tournaments_engine
+
+# Streamlit recharge parfois app.py sans recharger ses modules importés.
+# Cette étape garantit que l'interface et le moteur de tournoi utilisent
+# toujours exactement la même version après un déploiement à chaud.
+importlib.reload(tournaments_engine)
+
 from tournaments_v2 import (
     add_participants,
     build_round_schedule,
