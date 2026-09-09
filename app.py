@@ -35,6 +35,7 @@ from tournaments_v2 import (
     initialize_tournament_database,
     list_tournaments,
     load_tournament,
+    participant_key,
     parse_participant_batch,
     remove_participant,
     reopen_registrations,
@@ -4064,6 +4065,20 @@ elif page == "🏆 Tournois":
         )
         st.stop()
 
+    tournament_participant_groups = {}
+    tournament_backstage_data = st.session_state.get("backstage_data")
+    if (
+        isinstance(tournament_backstage_data, pd.DataFrame)
+        and "Pseudo" in tournament_backstage_data.columns
+        and "Groupe" in tournament_backstage_data.columns
+    ):
+        tournament_participant_groups = {
+            participant_key(row.get("Pseudo")): str(row.get("Groupe", "") or "").strip()
+            for row in tournament_backstage_data[["Pseudo", "Groupe"]].to_dict("records")
+            if participant_key(row.get("Pseudo"))
+            and str(row.get("Groupe", "") or "").strip()
+        }
+
     tournament_delete_notice = st.session_state.pop(
         "tournament_delete_notice",
         None,
@@ -4440,6 +4455,7 @@ elif page == "🏆 Tournois":
                     current_user_email,
                     current_user_name,
                     current_user_role,
+                    participant_groups=tournament_participant_groups,
                 )
                 if addition_result["duplicates"]:
                     st.warning(
@@ -4503,6 +4519,29 @@ elif page == "🏆 Tournois":
                 "validera le tirage du tournoi général."
             )
         if tournament["format"] == "2v2":
+            participant_groups_for_draw = {
+                participant_key(row.get("name")): (
+                    tournament_participant_groups.get(
+                        participant_key(row.get("name")),
+                        str(row.get("group", "") or "").strip(),
+                    )
+                )
+                for row in tournament.get("participants", [])
+            }
+            known_group_count = sum(
+                bool(group) and str(group).casefold() != "nan"
+                for group in participant_groups_for_draw.values()
+            )
+            st.info(
+                "Le tirage reste aléatoire et évite les duos composés de "
+                "deux créateurs du même groupe lorsque c’est possible."
+            )
+            if known_group_count < participant_count:
+                st.caption(
+                    f"Groupes identifiés : {known_group_count}/{participant_count}. "
+                    "Pour les autres créateurs, leur direction d’inscription "
+                    "sert de sécurité de remplacement."
+                )
             solo_policy_label = st.radio(
                 "Si un créateur reste seul",
                 [
@@ -4549,6 +4588,7 @@ elif page == "🏆 Tournois":
                     current_user_role,
                     solo_policy=solo_policy,
                     preview_only=True,
+                    participant_groups=tournament_participant_groups,
                 )
                 st.rerun()
             except Exception as error:
@@ -4598,20 +4638,52 @@ elif page == "🏆 Tournois":
             with st.form(
                 f"complete_schedule_form_{selected_tournament_id}"
             ):
-                edited_schedule_dataframe = st.data_editor(
-                    schedule_dataframe,
-                    use_container_width=True,
-                    hide_index=True,
-                    disabled=["N° tour", "Tour", "Match"],
-                    column_config={
-                        "N° tour": st.column_config.NumberColumn(width="small"),
-                        "Tour": st.column_config.TextColumn(width="medium"),
-                        "Match": st.column_config.NumberColumn(width="small"),
-                        "Date": st.column_config.TextColumn(width="medium"),
-                        "Heure": st.column_config.TextColumn(width="small"),
-                    },
-                    key=f"complete_schedule_editor_{selected_tournament_id}",
+                schedule_rows_to_save = []
+                schedule_records = schedule_dataframe.to_dict("records")
+                schedule_rounds = sorted(
+                    {int(row["N° tour"]) for row in schedule_records}
                 )
+                for schedule_round in schedule_rounds:
+                    round_records = [
+                        row
+                        for row in schedule_records
+                        if int(row["N° tour"]) == schedule_round
+                    ]
+                    round_title = round_records[0]["Tour"]
+                    with st.expander(
+                        f"📅 {round_title} — {len(round_records)} match(s)",
+                        expanded=True,
+                    ):
+                        for schedule_row in round_records:
+                            st.markdown(f"**Match {int(schedule_row['Match'])}**")
+                            date_column, time_column = st.columns(2)
+                            scheduled_date_value = date_column.text_input(
+                                "Date",
+                                value=str(schedule_row["Date"] or ""),
+                                placeholder="Exemple : 12/09/2026",
+                                key=(
+                                    f"full_date_{selected_tournament_id}_"
+                                    f"{schedule_round}_{int(schedule_row['Match'])}"
+                                ),
+                            )
+                            scheduled_time_value = time_column.text_input(
+                                "Heure",
+                                value=str(schedule_row["Heure"] or ""),
+                                placeholder="Exemple : 21H30",
+                                key=(
+                                    f"full_time_{selected_tournament_id}_"
+                                    f"{schedule_round}_{int(schedule_row['Match'])}"
+                                ),
+                            )
+                            schedule_rows_to_save.append(
+                                {
+                                    "round_number": schedule_round,
+                                    "round_label": round_title,
+                                    "match_number": int(schedule_row["Match"]),
+                                    "date": scheduled_date_value,
+                                    "time": scheduled_time_value,
+                                }
+                            )
                 save_complete_schedule = st.form_submit_button(
                     "💾 Enregistrer toutes les dates et heures",
                     type="primary",
@@ -4619,16 +4691,6 @@ elif page == "🏆 Tournois":
                 )
             if save_complete_schedule:
                 try:
-                    schedule_rows_to_save = [
-                        {
-                            "round_number": int(row["N° tour"]),
-                            "round_label": row["Tour"],
-                            "match_number": int(row["Match"]),
-                            "date": "" if pd.isna(row["Date"]) else row["Date"],
-                            "time": "" if pd.isna(row["Heure"]) else row["Heure"],
-                        }
-                        for row in edited_schedule_dataframe.to_dict("records")
-                    ]
                     update_round_schedule(
                         database_url,
                         selected_tournament_id,
