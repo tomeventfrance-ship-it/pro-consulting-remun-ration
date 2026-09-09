@@ -357,6 +357,7 @@ def add_participants(
     actor_email,
     actor_name,
     actor_role,
+    participant_groups=None,
 ):
     names = parse_participant_batch(names) if isinstance(names, str) else [
         clean_participant_name(name) for name in names
@@ -364,6 +365,12 @@ def add_participants(
     names = [name for name in names if participant_key(name)]
     if not names:
         raise ValueError("Aucun pseudo valide n'a ete trouve.")
+    participant_groups = participant_groups if isinstance(participant_groups, dict) else {}
+    normalized_groups = {
+        participant_key(name): str(group or "").strip()[:120]
+        for name, group in participant_groups.items()
+        if participant_key(name) and str(group or "").strip()
+    }
     with psycopg.connect(database_url) as connection:
         with connection.cursor() as cursor:
             tournament = _load_locked(cursor, tournament_id)
@@ -389,6 +396,7 @@ def add_participants(
                 participant = {
                     "id": secrets.token_hex(8),
                     "name": name,
+                    "group": normalized_groups.get(key, ""),
                     "added_by": normalize_email(actor_email),
                     "added_by_name": str(actor_name or "").strip(),
                     "added_at": timestamp,
@@ -459,8 +467,63 @@ def _competitor(members):
     }
 
 
+def _same_known_group(first, second):
+    """Vrai uniquement lorsque les deux créateurs ont le même groupe connu."""
+    first_group = " ".join(
+        str(first.get("group") or first.get("added_by", "")).casefold().split()
+    )
+    second_group = " ".join(
+        str(second.get("group") or second.get("added_by", "")).casefold().split()
+    )
+    return bool(first_group and first_group == second_group)
+
+
+def _prepare_duos(participants, solo_policy, randomizer):
+    """Tirage aléatoire minimisant les duos d'un même groupe."""
+    best_pairs = None
+    best_waiting = None
+    best_conflicts = None
+    # Plusieurs tirages réellement aléatoires sont comparés. Dès qu'un tirage
+    # sans duo du même groupe est trouvé, il est conservé.
+    for _ in range(512):
+        candidate = [dict(row) for row in participants]
+        randomizer.shuffle(candidate)
+        waiting = None
+        if len(candidate) % 2:
+            if solo_policy == "solo":
+                waiting = None
+            else:
+                waiting = candidate.pop()
+        pairs = [candidate[index:index + 2] for index in range(0, len(candidate), 2)]
+        conflicts = sum(
+            _same_known_group(pair[0], pair[1])
+            for pair in pairs
+            if len(pair) == 2
+        )
+        if best_conflicts is None or conflicts < best_conflicts:
+            best_pairs = pairs
+            best_waiting = waiting
+            best_conflicts = conflicts
+        if conflicts == 0:
+            break
+    competitors = [_competitor(pair) for pair in (best_pairs or [])]
+    if len(participants) % 2 and solo_policy == "solo":
+        used_ids = {
+            member.get("id")
+            for pair in (best_pairs or [])
+            for member in pair
+        }
+        solo_member = next(
+            (row for row in participants if row.get("id") not in used_ids),
+            None,
+        )
+        if solo_member:
+            competitors.append(_competitor([solo_member]))
+    return competitors, best_waiting
+
+
 def prepare_competitors(participants, tournament_format, solo_policy="waiting"):
-    """Melange les inscrits puis cree individus ou duos sans biais de liste."""
+    """Mélange les inscrits et évite les duos d'un même groupe si possible."""
     participants = [dict(row) for row in participants]
     randomizer = secrets.SystemRandom()
     randomizer.shuffle(participants)
@@ -468,15 +531,9 @@ def prepare_competitors(participants, tournament_format, solo_policy="waiting"):
     if tournament_format == "1v1":
         competitors = [_competitor([participant]) for participant in participants]
     elif tournament_format == "2v2":
-        competitors = []
-        while len(participants) >= 2:
-            competitors.append(_competitor(participants[:2]))
-            participants = participants[2:]
-        if participants:
-            if solo_policy == "solo":
-                competitors.append(_competitor(participants))
-            else:
-                waiting_participant = participants[0]
+        competitors, waiting_participant = _prepare_duos(
+            participants, solo_policy, randomizer
+        )
     else:
         raise ValueError("Format de tournoi invalide.")
     # Tirage des adversaires independant du tirage des duos.
@@ -587,6 +644,7 @@ def finalize_draw(
     solo_policy="waiting",
     force_redraw=False,
     preview_only=False,
+    participant_groups=None,
 ):
     if solo_policy not in {"waiting", "solo"}:
         raise ValueError("Gestion du participant seul invalide.")
@@ -599,6 +657,20 @@ def finalize_draw(
                 if not (actor_role == "admin" and force_redraw):
                     raise ValueError("Le tirage est deja valide.")
             participants = [dict(row) for row in tournament["participants"]]
+            participant_groups = (
+                participant_groups if isinstance(participant_groups, dict) else {}
+            )
+            normalized_groups = {
+                participant_key(name): str(group or "").strip()[:120]
+                for name, group in participant_groups.items()
+                if participant_key(name) and str(group or "").strip()
+            }
+            for participant in participants:
+                detected_group = normalized_groups.get(
+                    participant_key(participant.get("name"))
+                )
+                if detected_group:
+                    participant["group"] = detected_group
             minimum = 2 if tournament["format"] == "1v1" else 3
             if len(participants) < minimum:
                 raise ValueError("Nombre de participants insuffisant.")
@@ -621,6 +693,7 @@ def finalize_draw(
                 """
                 UPDATE pro_consulting_tournaments
                 SET status = %s, solo_policy = %s,
+                    participants = %s::jsonb,
                     competitors = %s::jsonb, matches = %s::jsonb,
                     round_schedule = %s::jsonb,
                     waiting_participant = %s::jsonb, draw_token = %s,
@@ -631,6 +704,7 @@ def finalize_draw(
                 (
                     target_status,
                     solo_policy,
+                    json.dumps(participants, ensure_ascii=False),
                     json.dumps(competitors, ensure_ascii=False),
                     json.dumps(matches, ensure_ascii=False),
                     json.dumps(round_schedule, ensure_ascii=False),
@@ -987,6 +1061,7 @@ def tournament_tables(tournament):
     participants = [
         {
             "Créateur": row.get("name", ""),
+            "Groupe": row.get("group", ""),
             "Ajouté par": row.get("added_by_name") or row.get("added_by", ""),
             "Ajouté le": row.get("added_at", ""),
         }
@@ -1009,4 +1084,3 @@ def tournament_tables(tournament):
             }
         )
     return participants, matches
-
