@@ -315,6 +315,32 @@ st.markdown(
         box-shadow: 0 14px 34px rgba(0, 25, 30, 0.18);
     }
 
+    /* Le planning est affiché sur fond clair : sa saisie doit rester sombre,
+       notamment dans l'éditeur mobile de Streamlit. */
+    [data-testid="stDataEditor"] [data-baseweb="input"] > div,
+    [data-baseweb="input"]:has(input[placeholder="Exemple : 12/09/2026"]) > div,
+    [data-baseweb="input"]:has(input[placeholder="Exemple : 21H30"]) > div {
+        background-color: #ffffff !important;
+        border-color: rgba(7, 27, 37, 0.32) !important;
+    }
+
+    [data-testid="stDataEditor"] input,
+    [data-testid="stDataEditor"] textarea,
+    input[placeholder="Exemple : 12/09/2026"],
+    input[placeholder="Exemple : 21H30"] {
+        color: #111827 !important;
+        -webkit-text-fill-color: #111827 !important;
+        caret-color: #111827 !important;
+        font-weight: 650 !important;
+    }
+
+    input[placeholder="Exemple : 12/09/2026"]::placeholder,
+    input[placeholder="Exemple : 21H30"]::placeholder {
+        color: #6b7280 !important;
+        -webkit-text-fill-color: #6b7280 !important;
+        opacity: 1 !important;
+    }
+
     hr {
         border-color: rgba(239, 206, 136, 0.18) !important;
     }
@@ -4714,7 +4740,14 @@ elif page == "🏆 Tournois":
                     st.error(f"Planning non enregistré : {error}")
         else:
             st.dataframe(
-                schedule_dataframe,
+                schedule_dataframe.style.set_properties(
+                    subset=["Date", "Heure"],
+                    **{
+                        "color": "#111827",
+                        "background-color": "#ffffff",
+                        "font-weight": "650",
+                    },
+                ),
                 use_container_width=True,
                 hide_index=True,
             )
