@@ -4668,7 +4668,7 @@ elif page == "🏆 Tournois":
                 for row in complete_schedule
             ]
         )
-        if current_user_role == "admin":
+        if can_finalize_tournament:
             with st.form(
                 f"complete_schedule_form_{selected_tournament_id}"
             ):
@@ -4861,7 +4861,7 @@ elif page == "🏆 Tournois":
                                 except Exception as error:
                                     st.error(f"Résultat non enregistré : {error}")
 
-                        if current_user_role == "admin" and not match.get("bye"):
+                        if can_finalize_tournament and not match.get("bye"):
                             with st.form(
                                 f"schedule_form_{selected_tournament_id}_{match['id']}"
                             ):
