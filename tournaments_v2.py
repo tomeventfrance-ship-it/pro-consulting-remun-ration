@@ -856,11 +856,14 @@ def update_match_schedule(
     actor_email,
     actor_role,
 ):
-    if actor_role != "admin":
-        raise PermissionError("Les dates et heures sont reservees au fondateur.")
     with psycopg.connect(database_url) as connection:
         with connection.cursor() as cursor:
             tournament = _load_locked(cursor, tournament_id)
+            if not _can_finalize(tournament, actor_email, actor_role):
+                raise PermissionError(
+                    "Les dates et heures sont reservees au fondateur ou au "
+                    "directeur proprietaire du tournoi."
+                )
             matches = [dict(row) for row in tournament["matches"]]
             target = next((row for row in matches if row.get("id") == match_id), None)
             if target is None:
@@ -912,12 +915,15 @@ def update_round_schedule(
     actor_email,
     actor_role,
 ):
-    """Enregistre en une fois le planning complet, réservé au fondateur."""
-    if actor_role != "admin":
-        raise PermissionError("Le planning complet est reserve au fondateur.")
+    """Enregistre le planning du fondateur ou du directeur propriétaire."""
     with psycopg.connect(database_url) as connection:
         with connection.cursor() as cursor:
             tournament = _load_locked(cursor, tournament_id)
+            if not _can_finalize(tournament, actor_email, actor_role):
+                raise PermissionError(
+                    "Le planning complet est reserve au fondateur ou au "
+                    "directeur proprietaire du tournoi."
+                )
             blueprint = tournament.get("round_schedule", []) or build_round_schedule(
                 len(tournament.get("competitors", [])), tournament["format"]
             )
