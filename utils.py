@@ -5,6 +5,11 @@ import unicodedata
 import pandas as pd
 
 
+CREATOR_REWARD_EXCLUDED_GROUPS = {
+    "dans aucun groupe",
+}
+
+
 # Noms possibles des colonnes de l’export Backstage
 COLUMN_ALIASES = {
     "pseudo": [
@@ -55,6 +60,11 @@ def normalize_text(value: object) -> str:
     text = re.sub(r"\s+", " ", text)
 
     return text
+
+
+def is_creator_reward_excluded_group(value: object) -> bool:
+    """Indique si un groupe est exclu des récompenses personnelles."""
+    return normalize_text(value) in CREATOR_REWARD_EXCLUDED_GROUPS
 
 
 def find_column(
@@ -369,6 +379,21 @@ def calculate_creator_rewards(
     result["Rémunération 💎"] = rewards
     result["Motif rémunération"] = reward_reasons
     result["Compté hiérarchie"] = hierarchy_eligibility
+
+    # Les créateurs sans groupe identifié ne doivent recevoir aucune
+    # récompense personnelle. Leur éligibilité hiérarchique reste intacte
+    # afin de ne pas modifier les calculs des consultants et responsables.
+    if "Groupe" in result.columns:
+        excluded_group_mask = result["Groupe"].map(
+            is_creator_reward_excluded_group
+        )
+        result.loc[excluded_group_mask, "Taux de base"] = 0.0
+        result.loc[excluded_group_mask, "Bonus activité"] = 0.0
+        result.loc[excluded_group_mask, "Rémunération 💎"] = 0
+        result.loc[
+            excluded_group_mask,
+            "Motif rémunération",
+        ] = "Groupe exclu des récompenses créateurs"
 
     return result
 # Barème général des consultants
