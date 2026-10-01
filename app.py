@@ -25,6 +25,7 @@ from pywebpush import WebPushException, webpush
 from utils import (
     calculate_consultant_rewards,
     calculate_creator_rewards,
+    is_creator_reward_excluded_group,
     prepare_backstage_data,
 )
 import tournaments_v2 as tournaments_engine
@@ -2215,10 +2216,32 @@ def clean_reward_tracking_rows(rows):
     return cleaned_rows
 
 
+def filter_creator_reward_rows(dataframe):
+    """Retire des tableaux de récompenses les groupes exclus."""
+    if not isinstance(dataframe, pd.DataFrame):
+        return pd.DataFrame()
+    if dataframe.empty or "Groupe" not in dataframe.columns:
+        return dataframe.copy()
+    excluded_mask = dataframe["Groupe"].map(
+        is_creator_reward_excluded_group
+    )
+    return dataframe.loc[~excluded_mask].copy().reset_index(drop=True)
+
+
+def filter_reward_tracking_rows(rows):
+    """Nettoie aussi les anciennes lignes déjà enregistrées dans le suivi."""
+    return [
+        row
+        for row in clean_reward_tracking_rows(rows)
+        if not is_creator_reward_excluded_group(row.get("Groupe", ""))
+    ]
+
+
 def build_reward_tracking_table(creator_results, saved_rows=None):
     """Fusionne les créateurs calculés avec les champs manuels sauvegardés."""
+    creator_results = filter_creator_reward_rows(creator_results)
     saved_by_creator = {}
-    for saved_row in clean_reward_tracking_rows(saved_rows or []):
+    for saved_row in filter_reward_tracking_rows(saved_rows or []):
         saved_by_creator.setdefault(saved_row["Créateur"], []).append(
             saved_row
         )
@@ -2309,9 +2332,9 @@ def merge_collective_reward_tracking_rows(
     allow_new_rows=True,
 ):
     """Fusionne une sauvegarde sans effacer le travail d'un autre compte."""
-    remote_rows = clean_reward_tracking_rows(remote_rows)
-    local_rows = clean_reward_tracking_rows(local_rows)
-    baseline_rows = clean_reward_tracking_rows(baseline_rows)
+    remote_rows = filter_reward_tracking_rows(remote_rows)
+    local_rows = filter_reward_tracking_rows(local_rows)
+    baseline_rows = filter_reward_tracking_rows(baseline_rows)
 
     def rows_by_creator(rows):
         return {
@@ -5539,6 +5562,10 @@ elif page == "🛡️ Administration":
         f"**{current_user_direction}**. Elles n’affectent aucune autre "
         "direction."
     )
+    st.caption(
+        "Le groupe « dans aucun groupe » est automatiquement exclu des "
+        "tableaux de récompenses créateurs."
+    )
 
     exclusions_save_notice = st.session_state.pop(
         "exclusions_save_notice",
@@ -6130,9 +6157,32 @@ elif page == "💎 Créateurs":
     if "Inclure rémunération créateur" not in creator_results.columns:
         creator_results["Inclure rémunération créateur"] = "Oui"
 
+    if "Groupe" in creator_results.columns:
+        excluded_creator_reward_mask = creator_results["Groupe"].map(
+            is_creator_reward_excluded_group
+        )
+    else:
+        excluded_creator_reward_mask = pd.Series(
+            False,
+            index=creator_results.index,
+        )
+    creator_results.loc[
+        excluded_creator_reward_mask,
+        "Inclure rémunération créateur",
+    ] = "Non"
+    creator_results.loc[
+        excluded_creator_reward_mask,
+        "Rémunération 💎",
+    ] = 0
+    visible_creator_indices = creator_results.index[
+        ~excluded_creator_reward_mask
+    ]
+
     st.divider()
     payment_source = add_invoice_amount_column(
-        financial_columns(creator_results)
+        financial_columns(
+            creator_results.loc[visible_creator_indices].copy()
+        )
     )
     payment_table = payment_source[
         [
@@ -6190,12 +6240,16 @@ elif page == "💎 Créateurs":
         key="download_creator_payments",
     )
 
-    creator_results["Mode paiement"] = edited_payment_table[
-        "Mode paiement"
-    ].values
-    creator_results["Inclure rémunération créateur"] = (
-        edited_payment_table["Inclure rémunération créateur"].values
-    )
+    creator_results.loc[
+        visible_creator_indices,
+        "Mode paiement",
+    ] = edited_payment_table["Mode paiement"].to_numpy()
+    creator_results.loc[
+        visible_creator_indices,
+        "Inclure rémunération créateur",
+    ] = edited_payment_table[
+        "Inclure rémunération créateur"
+    ].to_numpy()
     creator_results["Rémunération 💎"] = creator_results[
         "Rémunération calculée 💎"
     ].where(
@@ -6205,6 +6259,9 @@ elif page == "💎 Créateurs":
     creator_results = financial_columns(creator_results)
     creator_results = add_invoice_amount_column(creator_results)
     st.session_state.creator_results = creator_results
+    visible_creator_results = creator_results.loc[
+        visible_creator_indices
+    ].copy().reset_index(drop=True)
 
     if st.button(
         "💾 Enregistrer les modes de paiement des créateurs",
@@ -6221,7 +6278,7 @@ elif page == "💎 Créateurs":
         )
         saved_creator_preferences.update({
             payment_entity_key(row["Pseudo"]): row["Mode paiement"]
-            for row in creator_results.to_dict("records")
+            for row in visible_creator_results.to_dict("records")
         })
         st.session_state.payment_preferences["creators"] = (
             saved_creator_preferences
@@ -6242,35 +6299,39 @@ elif page == "💎 Créateurs":
             "synchronisés automatiquement."
         )
 
-    diamond_total = creator_results.loc[
-        creator_results["Mode paiement"] == "Diamants",
+    diamond_total = visible_creator_results.loc[
+        visible_creator_results["Mode paiement"] == "Diamants",
         "Rémunération 💎",
     ].sum()
     metric1, metric2, metric3, metric4, metric5 = st.columns(5)
-    metric1.metric("Créateurs importés", len(creator_results))
+    metric1.metric("Créateurs importés", len(visible_creator_results))
     metric2.metric(
         "Créateurs rémunérés",
-        int((creator_results["Rémunération 💎"] > 0).sum()),
+        int((visible_creator_results["Rémunération 💎"] > 0).sum()),
     )
     metric3.metric("Paiements diamants", f"{diamond_total:,.0f} 💎")
     metric4.metric(
         "Paiements factures",
-        f"{creator_results['Facture €'].sum():,.0f} €",
+        f"{visible_creator_results['Facture €'].sum():,.0f} €",
     )
     metric5.metric(
         "Comptés pour la hiérarchie",
-        int((creator_results["Compté hiérarchie"] == "Oui").sum()),
+        int(
+            (
+                visible_creator_results["Compté hiérarchie"] == "Oui"
+            ).sum()
+        ),
     )
-    show_financial_summary(creator_results)
+    show_financial_summary(visible_creator_results)
 
     with st.expander("Afficher le détail complet des calculs"):
         st.dataframe(
-            creator_results,
+            visible_creator_results,
             use_container_width=True,
             hide_index=True,
         )
         show_excel_download(
-            creator_results,
+            visible_creator_results,
             table_name="detail_createurs",
             sheet_name="Détail créateurs",
             key="download_creator_details",
@@ -6770,6 +6831,9 @@ elif page == "🎁 Suivi récompenses":
         creator_results_for_tracking = (
             st.session_state.creator_results.copy()
         )
+        creator_results_for_tracking = filter_creator_reward_rows(
+            creator_results_for_tracking
+        )
 
     tracking_scope = reward_tracking_scope()
     if (
@@ -6903,7 +6967,10 @@ elif page == "🎁 Suivi récompenses":
     else:
         st.caption(f"Mois collectif actif : {active_tracking_month}")
 
-    tracking_table = st.session_state.reward_tracking_table.copy()
+    tracking_table = filter_creator_reward_rows(
+        st.session_state.reward_tracking_table.copy()
+    )
+    st.session_state.reward_tracking_table = tracking_table.copy()
     if tracking_table.empty:
         st.warning(
             "Le suivi collectif est vide. Importez un export Backstage pour "
