@@ -22,6 +22,12 @@ from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 from pywebpush import WebPushException, webpush
 
+# Streamlit peut conserver l'ancienne version de utils en mémoire pendant un
+# déploiement à chaud. On la recharge avant d'importer les nouveaux helpers.
+import utils as rewards_utils
+
+importlib.reload(rewards_utils)
+
 from utils import (
     calculate_consultant_rewards,
     calculate_creator_rewards,
