@@ -3188,7 +3188,7 @@ def clean_collaborator_access_records(rows, available_groups=None):
     return cleaned
 
 
-def build_authorized_users(database_url):
+def build_authorized_users(database_url, refresh=False):
     """Réunit les comptes protégés et les collaborateurs actifs."""
     authorized_users = {
         email: dict(access)
@@ -3201,7 +3201,13 @@ def build_authorized_users(database_url):
 
     try:
         initialize_settings_database(database_url)
-        authorization_payloads = load_authorization_payloads(database_url)
+        if refresh:
+            authorization_payloads = load_persistent_scopes(
+                database_url,
+                (director_management_scope(), collaborator_access_scope()),
+            )
+        else:
+            authorization_payloads = load_authorization_payloads(database_url)
         director_payload = authorization_payloads[
             director_management_scope()
         ]
@@ -3290,7 +3296,11 @@ def clean_director_management_config(payload, available_groups):
         except (TypeError, ValueError):
             return 0.0
 
-    available_group_set = set(available_groups)
+    available_by_key = {
+        normalize_group_name(group): str(group).strip()
+        for group in available_groups
+        if normalize_group_name(group)
+    }
     payload = payload if isinstance(payload, dict) else {}
     cleaned_config = default_director_management_config()
 
@@ -3302,12 +3312,19 @@ def clean_director_management_config(payload, available_groups):
         if not isinstance(saved_groups, list):
             saved_groups = []
 
+        cleaned_groups = []
+        seen_group_keys = set()
+        for group in saved_groups:
+            group_key = normalize_group_name(group)
+            if not group_key or group_key in seen_group_keys:
+                continue
+            seen_group_keys.add(group_key)
+            cleaned_groups.append(
+                available_by_key.get(group_key, str(group).strip())
+            )
+
         cleaned_config[email] = {
-            "groups": [
-                str(group)
-                for group in saved_groups
-                if str(group) in available_group_set
-            ],
+            "groups": cleaned_groups,
             "revenue_usd": non_negative_number(
                 saved_row.get("revenue_usd", 0.0)
             ),
@@ -3337,6 +3354,114 @@ def normalize_group_name(value):
     return " ".join(normalized.split())
 
 
+def merge_director_group_assignments(payload, group_changes):
+    """Modifie uniquement les groupes, en conservant les autres données."""
+    payload = dict(payload or {})
+    saved_directors = payload.get("directors", {})
+    saved_directors = (
+        saved_directors if isinstance(saved_directors, dict) else {}
+    )
+    directors = {
+        email: dict(row) if isinstance(row, dict) else {}
+        for email, row in saved_directors.items()
+    }
+    protected_emails = {
+        profile["email"] for profile in DIRECTOR_MANAGEMENT_PROFILES
+    }
+    for email, groups in group_changes.items():
+        if email not in protected_emails or not isinstance(groups, list):
+            raise ValueError("Affectation de direction invalide.")
+        row = dict(directors.get(email, {}))
+        group_names = {}
+        for group in groups:
+            group_key = normalize_group_name(group)
+            if group_key:
+                group_names.setdefault(group_key, str(group).strip())
+        row["groups"] = list(group_names.values())
+        directors[email] = row
+
+    group_owners = {}
+    for email, row in directors.items():
+        for group in row.get("groups", []):
+            group_key = normalize_group_name(group)
+            if not group_key:
+                continue
+            previous_owner = group_owners.setdefault(group_key, email)
+            if previous_owner != email:
+                raise ValueError(
+                    "Un groupe ne peut appartenir qu’à un seul directeur."
+                )
+
+    payload["directors"] = directors
+    return payload
+
+
+def save_director_group_assignments(database_url, group_changes, updated_by):
+    """Enregistre les affectations seules, sans écraser les montants saisis."""
+    admin_access = BASE_AUTHORIZED_USERS.get(normalize_email(updated_by), {})
+    if admin_access.get("role") != "admin":
+        raise PermissionError("Seul l’administrateur attribue les groupes.")
+
+    scope = director_management_scope()
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO pro_consulting_settings (scope, payload, updated_by)
+                VALUES (%s, '{}'::jsonb, %s)
+                ON CONFLICT (scope) DO NOTHING
+                """,
+                (scope, updated_by),
+            )
+            cursor.execute(
+                """
+                SELECT payload FROM pro_consulting_settings
+                WHERE scope = %s FOR UPDATE
+                """,
+                (scope,),
+            )
+            row = cursor.fetchone()
+            saved_payload = row[0] if row else {}
+            if isinstance(saved_payload, str):
+                saved_payload = json.loads(saved_payload)
+            payload = merge_director_group_assignments(
+                saved_payload, group_changes
+            )
+            payload["saved_at"] = datetime.now(ZoneInfo("Europe/Paris")).isoformat(
+                timespec="seconds"
+            )
+            cursor.execute(
+                """
+                UPDATE pro_consulting_settings
+                SET payload = %s::jsonb, updated_at = CURRENT_TIMESTAMP,
+                    updated_by = %s
+                WHERE scope = %s RETURNING payload
+                """,
+                (json.dumps(payload, ensure_ascii=False), updated_by, scope),
+            )
+            confirmed_row = cursor.fetchone()
+            if not confirmed_row:
+                raise RuntimeError("La base n’a pas confirmé les affectations.")
+            confirmed_payload = confirmed_row[0]
+            if isinstance(confirmed_payload, str):
+                confirmed_payload = json.loads(confirmed_payload)
+            if confirmed_payload != payload:
+                raise RuntimeError("Les affectations enregistrées diffèrent.")
+        connection.commit()
+
+    load_authorization_payloads.clear()
+    return confirmed_payload
+
+
+def queue_director_group_assignment(email, widget_key):
+    """Prépare uniquement l’affectation modifiée par l’administrateur."""
+    pending = dict(
+        st.session_state.get("pending_director_group_assignments", {})
+    )
+    pending[email] = list(st.session_state.get(widget_key, []))
+    st.session_state.pending_director_group_assignments = pending
+
+
 def validate_director_import_groups(
     prepared_dataframe,
     user_email,
@@ -3355,9 +3480,22 @@ def validate_director_import_groups(
         }
 
     normalized_user_email = normalize_email(user_email)
-    user_access = globals().get("AUTHORIZED_USERS", {}).get(
-        normalized_user_email
+    # Le contrôle d'import doit voir les affectations enregistrées maintenant,
+    # même si le directeur avait déjà ouvert la page avant leur modification.
+    fresh_access, access_error = build_authorized_users(
+        database_url, refresh=True
     )
+    if access_error:
+        return {
+            "valid": False,
+            "error": (
+                "Les groupes autorisés ne peuvent pas être relus en base. "
+                "Votre dernier export enregistré est conservé. Réessayez."
+            ),
+            "missing_groups": [],
+            "unexpected_groups": [],
+        }
+    user_access = fresh_access.get(normalized_user_email)
     if not user_access or user_access.get("role") != "director":
         return {
             "valid": False,
@@ -3533,6 +3671,9 @@ if st.session_state.get("active_user_email") != current_user_email:
     st.session_state.pop("backstage_restore_error", None)
     st.session_state.pop("admin_director_management_loaded", None)
     st.session_state.pop("admin_director_management_config", None)
+    st.session_state.pop("admin_director_group_versions", None)
+    st.session_state.pop("pending_director_group_assignments", None)
+    st.session_state.pop("director_group_save_notice", None)
     st.session_state.pop("admin_collaborator_access_loaded", None)
     st.session_state.pop("admin_collaborator_access_rows", None)
     st.session_state.pop("chat_push_saved_endpoint", None)
@@ -5164,6 +5305,15 @@ elif page == "📥 Import Backstage":
         ),
         key=f"backstage_file_uploader_{uploader_generation}",
     )
+
+    if current_user_role == "director":
+        if st.button(
+            "🔄 Relire mes groupes et vérifier l’export",
+            key="refresh_director_import_groups",
+            use_container_width=True,
+            help="Relance le contrôle après une modification faite par le fondateur.",
+        ):
+            load_authorization_payloads.clear()
 
     if uploaded_file is not None:
         try:
@@ -7446,44 +7596,46 @@ elif page == "🏢 Directeur de branche":
         st.info(
             "Cet espace privé vous permet d’affecter les groupes aux "
             "quatre directeurs et d’afficher leurs factures en une seule "
-            "fois. Ces affectations sécurisent aussi leurs imports : un "
+            "fois. Les changements de groupes sont enregistrés automatiquement "
+            "et sécurisent aussi leurs imports : un "
             "groupe manquant ou non autorisé bloque entièrement le fichier. "
             "Les directeurs ne voient pas cette vue d’ensemble."
         )
 
-        if not st.session_state.get("admin_director_management_loaded"):
-            saved_director_config = {}
-            if persistent_settings_available:
-                try:
-                    saved_payload = load_persistent_scope(
-                        database_url,
-                        director_management_scope(),
-                    )
-                    saved_director_config = saved_payload.get(
-                        "directors",
-                        {},
-                    )
-                except Exception:
-                    st.warning(
-                        "Les affectations enregistrées n’ont pas pu être "
-                        "chargées. Vous pouvez poursuivre dans cette session."
-                    )
-
-            st.session_state.admin_director_management_config = (
-                clean_director_management_config(
-                    saved_director_config,
-                    available_groups,
-                )
+        saved_director_payload = {
+            "directors": st.session_state.get(
+                "admin_director_management_config", {}
             )
-            st.session_state.admin_director_management_loaded = True
-
+        }
+        if persistent_settings_available:
+            try:
+                saved_director_payload = load_persistent_scope(
+                    database_url,
+                    director_management_scope(),
+                )
+            except Exception:
+                st.error(
+                    "Les affectations enregistrées ne peuvent pas être "
+                    "relues. Réessayez avant de modifier les directions."
+                )
+                st.stop()
         saved_director_config = clean_director_management_config(
-            st.session_state.get(
-                "admin_director_management_config",
-                {},
-            ),
+            saved_director_payload.get("directors", {}),
             available_groups,
         )
+        st.session_state.admin_director_management_config = (
+            saved_director_config
+        )
+        st.session_state.admin_director_management_loaded = True
+        available_director_groups = set(available_groups)
+        for row in saved_director_config.values():
+            available_director_groups.update(row["groups"])
+
+        group_save_notice = st.session_state.pop(
+            "director_group_save_notice", None
+        )
+        if group_save_notice:
+            st.success(group_save_notice)
 
         st.subheader("Taux de conversion quotidien")
         rate_column, refresh_column = st.columns([3, 1])
@@ -7508,12 +7660,40 @@ elif page == "🏢 Directeur de branche":
             st.warning(director_rate_info["warning"])
 
         st.subheader("Affectation des groupes et chiffres d’affaires")
+        st.caption(
+            "Les groupes attribués restent enregistrés même s’ils sont "
+            "absents de l’export actuel. Pour les chiffres d’affaires et "
+            "dépenses, utilisez « Enregistrer les quatre directions »."
+        )
         edited_director_config = {}
+        pending_group_assignments = st.session_state.get(
+            "pending_director_group_assignments", {}
+        )
+        group_versions = st.session_state.setdefault(
+            "admin_director_group_versions", {}
+        )
 
         for profile in DIRECTOR_MANAGEMENT_PROFILES:
             email = profile["email"]
             saved_row = saved_director_config[email]
             key_suffix = re.sub(r"[^a-z0-9]+", "_", profile["name"].lower())
+            group_widget_key = f"admin_director_groups_{key_suffix}"
+            saved_group_version = tuple(
+                normalize_group_name(group) for group in saved_row["groups"]
+            )
+            if (
+                email in group_versions
+                and group_versions[email] != saved_group_version
+                and email not in pending_group_assignments
+            ):
+                st.session_state[group_widget_key] = saved_row["groups"]
+            group_versions[email] = saved_group_version
+            director_group_options = sorted(
+                available_director_groups.union(
+                    st.session_state.get(group_widget_key, [])
+                ),
+                key=lambda value: value.casefold(),
+            )
 
             with st.expander(
                 f"{profile['name']} — {profile['direction']}",
@@ -7521,10 +7701,27 @@ elif page == "🏢 Directeur de branche":
             ):
                 selected_director_groups = st.multiselect(
                     "Groupes en gestion",
-                    options=available_groups,
+                    options=director_group_options,
                     default=saved_row["groups"],
-                    key=f"admin_director_groups_{key_suffix}",
+                    key=group_widget_key,
+                    on_change=queue_director_group_assignment,
+                    args=(email, group_widget_key),
                 )
+                if set(map(normalize_group_name, selected_director_groups)) != set(
+                    map(normalize_group_name, saved_row["groups"])
+                ):
+                    st.caption("Ces groupes sont en attente d’enregistrement.")
+                    if st.button(
+                        f"💾 Enregistrer les groupes de {profile['name']}",
+                        key=f"save_director_groups_{key_suffix}",
+                        use_container_width=True,
+                        disabled=not persistent_settings_available,
+                    ):
+                        queue_director_group_assignment(email, group_widget_key)
+                elif persistent_settings_available:
+                    st.caption("Groupes enregistrés pour les imports du directeur.")
+                else:
+                    st.caption("La base doit être disponible pour confirmer ces groupes.")
                 revenue_column, expenses_column = st.columns(2)
                 director_revenue_usd = revenue_column.number_input(
                     "Chiffre d’affaires de la branche ($)",
@@ -7548,12 +7745,17 @@ elif page == "🏢 Directeur de branche":
             }
 
         group_owners = {}
+        group_labels = {}
         for profile in DIRECTOR_MANAGEMENT_PROFILES:
             for group in edited_director_config[profile["email"]]["groups"]:
-                group_owners.setdefault(group, []).append(profile["name"])
+                group_key = normalize_group_name(group)
+                group_labels.setdefault(group_key, group)
+                owners = group_owners.setdefault(group_key, [])
+                if profile["name"] not in owners:
+                    owners.append(profile["name"])
 
         duplicate_groups = {
-            group: owners
+            group_labels[group]: owners
             for group, owners in group_owners.items()
             if len(owners) > 1
         }
@@ -7567,6 +7769,45 @@ elif page == "🏢 Directeur de branche":
                 f"Corrigez les doublons suivants : {duplicate_details}."
             )
 
+        group_changes = st.session_state.get(
+            "pending_director_group_assignments", {}
+        )
+        if group_changes and not duplicate_groups:
+            if not persistent_settings_available:
+                st.error(
+                    "La base permanente est indisponible. Les changements "
+                    "de groupes ne sont pas enregistrés."
+                )
+                st.stop()
+            try:
+                confirmed_group_payload = save_director_group_assignments(
+                    database_url, group_changes, current_user_email
+                )
+            except ValueError as error:
+                st.error(str(error))
+                st.stop()
+            except Exception:
+                st.error(
+                    "Les groupes n’ont pas pu être enregistrés. Les "
+                    "affectations précédentes restent actives."
+                )
+                if st.button("Réessayer l’enregistrement des groupes"):
+                    st.rerun()
+                st.stop()
+            st.session_state.admin_director_management_config = (
+                clean_director_management_config(
+                    confirmed_group_payload.get("directors", {}),
+                    available_groups,
+                )
+            )
+            st.session_state.pending_director_group_assignments = {}
+            st.session_state.director_group_save_notice = (
+                "Les groupes sont enregistrés en base et disponibles pour "
+                "les imports des directeurs. Les montants saisis restent "
+                "à enregistrer avec le bouton ci-dessous."
+            )
+            st.rerun()
+
         save_director_config = st.button(
             "💾 Enregistrer les quatre directions",
             key="save_admin_director_management",
@@ -7575,22 +7816,38 @@ elif page == "🏢 Directeur de branche":
             disabled=bool(duplicate_groups),
         )
         if save_director_config:
-            st.session_state.admin_director_management_config = (
-                edited_director_config
-            )
             if persistent_settings_available:
                 try:
+                    director_payload_to_save = merge_director_group_assignments(
+                        load_persistent_scope(
+                            database_url, director_management_scope()
+                        ),
+                        {
+                            email: row["groups"]
+                            for email, row in edited_director_config.items()
+                        },
+                    )
+                    for email, row in edited_director_config.items():
+                        director_payload_to_save["directors"][email].update(row)
+                    director_payload_to_save["saved_at"] = datetime.now().isoformat(
+                        timespec="seconds"
+                    )
                     save_persistent_scopes(
                         database_url,
                         {
-                            director_management_scope(): {
-                                "directors": edited_director_config,
-                                "saved_at": datetime.now().isoformat(
-                                    timespec="seconds"
-                                ),
-                            }
+                            director_management_scope(): director_payload_to_save
                         },
                         current_user_email,
+                    )
+                    confirmed_director_payload = load_persistent_scope(
+                        database_url, director_management_scope()
+                    )
+                    if confirmed_director_payload != director_payload_to_save:
+                        raise RuntimeError(
+                            "La base n’a pas confirmé les quatre directions."
+                        )
+                    st.session_state.admin_director_management_config = (
+                        edited_director_config
                     )
                     st.success(
                         "Les groupes, chiffres d’affaires et dépenses des "
