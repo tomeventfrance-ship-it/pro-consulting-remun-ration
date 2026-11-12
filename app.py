@@ -1717,8 +1717,16 @@ def send_collective_chat_push_notifications(
     message_id,
 ):
     """Envoie le nouveau message aux téléphones abonnés, sauf à l’auteur."""
-    web_push_keys = get_or_create_web_push_keys(database_url)
     normalized_author = normalize_email(author_email)
+    authorized_users, access_error = build_authorized_users(database_url, refresh=True)
+    if access_error or normalized_author not in authorized_users:
+        return 0
+    recipient_emails = [
+        email for email in authorized_users if email != normalized_author
+    ]
+    if not recipient_emails:
+        return 0
+    web_push_keys = get_or_create_web_push_keys(database_url)
     with psycopg.connect(database_url) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -1726,9 +1734,9 @@ def send_collective_chat_push_notifications(
                 SELECT endpoint, subscription
                 FROM pro_consulting_push_subscriptions
                 WHERE active = TRUE
-                  AND user_email <> %s
+                  AND user_email = ANY(%s)
                 """,
-                (normalized_author,),
+                (recipient_emails,),
             )
             subscriptions = cursor.fetchall()
 
@@ -3007,11 +3015,12 @@ def build_director_overview(
     all_creator_results,
     director_config,
     usd_to_eur,
+    director_profiles,
 ):
-    """Construit la synthèse financière des quatre directions."""
+    """Construit la synthèse des directions affichées."""
     director_rows = []
 
-    for profile in DIRECTOR_MANAGEMENT_PROFILES:
+    for profile in director_profiles:
         email = profile["email"]
         direction_config = director_config[email]
         selected_groups = direction_config["groups"]
@@ -3188,16 +3197,63 @@ def clean_collaborator_access_records(rows, available_groups=None):
     return cleaned
 
 
-def build_authorized_users(database_url, refresh=False):
-    """Réunit les comptes protégés et les collaborateurs actifs."""
-    authorized_users = {
-        email: dict(access)
+def build_collaborator_directory(authorization_payloads):
+    """Réunit les comptes actifs et archivés sans modifier leurs affectations."""
+    collaborator_payload = authorization_payloads.get(collaborator_access_scope(), {})
+    archived_directors = collaborator_payload.get("archived_directors", [])
+    if not isinstance(archived_directors, list):
+        raise ValueError("Liste des directions archivées invalide.")
+    archived_emails = {normalize_email(email) for email in archived_directors}
+    directory = {
+        email: {
+            **access,
+            "groups": [],
+            "active": access["role"] == "admin" or email not in archived_emails,
+        }
         for email, access in BASE_AUTHORIZED_USERS.items()
     }
-    access_error = None
+    director_config = authorization_payloads.get(director_management_scope(), {}).get(
+        "directors", {}
+    )
+    if isinstance(director_config, dict):
+        for email, row in director_config.items():
+            access = directory.get(normalize_email(email))
+            if access and access["role"] == "director" and isinstance(row, dict):
+                groups = row.get("groups", [])
+                if isinstance(groups, list):
+                    access["groups"] = list(groups)
+
+    for collaborator in clean_collaborator_access_records(
+        collaborator_payload.get("collaborators", [])
+    ):
+        role = collaborator["role"]
+        name = collaborator["name"]
+        directory[collaborator["email"]] = {
+            **collaborator,
+            "direction": (
+                f"Direction {name}"
+                if role == "director"
+                else f"Responsable performance • {name}"
+            ),
+            "managed_access": True,
+        }
+    return directory
+
+
+def build_authorized_users(database_url, refresh=True):
+    """Autorise les comptes actifs, avec le fondateur comme seul secours."""
+    founder_access = {
+        email: dict(access)
+        for email, access in BASE_AUTHORIZED_USERS.items()
+        if access["role"] == "admin"
+    }
+    access_error = (
+        "Les accès collaborateurs ne peuvent pas être vérifiés pour le "
+        "moment. Seul le compte fondateur reste accessible."
+    )
 
     if not database_url:
-        return authorized_users, access_error
+        return founder_access, access_error
 
     try:
         initialize_settings_database(database_url)
@@ -3208,50 +3264,11 @@ def build_authorized_users(database_url, refresh=False):
             )
         else:
             authorization_payloads = load_authorization_payloads(database_url)
-        director_payload = authorization_payloads[
-            director_management_scope()
-        ]
-        director_config = director_payload.get("directors", {})
-        if isinstance(director_config, dict):
-            for email, saved_row in director_config.items():
-                normalized_email = normalize_email(email)
-                if (
-                    normalized_email in authorized_users
-                    and isinstance(saved_row, dict)
-                ):
-                    authorized_users[normalized_email]["groups"] = list(
-                        saved_row.get("groups", [])
-                    )
-
-        collaborator_payload = authorization_payloads[
-            collaborator_access_scope()
-        ]
-        collaborator_rows = clean_collaborator_access_records(
-            collaborator_payload.get("collaborators", [])
-        )
-        for collaborator in collaborator_rows:
-            if not collaborator["active"]:
-                continue
-            role = collaborator["role"]
-            authorized_users[collaborator["email"]] = {
-                "name": collaborator["name"],
-                "role": role,
-                "direction": (
-                    f"Direction {collaborator['name']}"
-                    if role == "director"
-                    else f"Responsable performance • {collaborator['name']}"
-                ),
-                "groups": list(collaborator["groups"]),
-                "managed_access": True,
-            }
+        directory = build_collaborator_directory(authorization_payloads)
     except Exception:
-        access_error = (
-            "La liste des collaborateurs ajoutés ne peut pas être chargée "
-            "pour le moment. Les comptes administrateur et directeurs "
-            "protégés restent accessibles."
-        )
+        return founder_access, access_error
 
-    return authorized_users, access_error
+    return {email: access for email, access in directory.items() if access["active"]}, None
 
 DIRECTOR_MANAGEMENT_PROFILES = (
     {
@@ -3275,6 +3292,159 @@ DIRECTOR_MANAGEMENT_PROFILES = (
         "direction": "Direction Vivi",
     },
 )
+
+
+def active_director_profiles(authorized_users):
+    """Les directions d’origine encore actives dans les vues de gestion."""
+    return tuple(
+        profile for profile in DIRECTOR_MANAGEMENT_PROFILES
+        if authorized_users.get(profile["email"], {}).get("role") == "director"
+    )
+
+
+def update_authorization_scope(database_url, scope, updated_by, update_payload):
+    """Verrouille les accès et les affectations pendant une modification."""
+    admin_access = BASE_AUTHORIZED_USERS.get(normalize_email(updated_by), {})
+    if admin_access.get("role") != "admin":
+        raise PermissionError("Seul le fondateur peut gérer les accès.")
+
+    scopes = (collaborator_access_scope(), director_management_scope())
+    if scope not in scopes:
+        raise ValueError("Configuration d’accès invalide.")
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            payloads = {}
+            for locked_scope in scopes:
+                cursor.execute(
+                    """
+                    INSERT INTO pro_consulting_settings (scope, payload, updated_by)
+                    VALUES (%s, '{}'::jsonb, %s)
+                    ON CONFLICT (scope) DO NOTHING
+                    """,
+                    (locked_scope, updated_by),
+                )
+                cursor.execute(
+                    """
+                    SELECT payload FROM pro_consulting_settings
+                    WHERE scope = %s FOR UPDATE
+                    """,
+                    (locked_scope,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise RuntimeError("La configuration d’accès est indisponible.")
+                payloads[locked_scope] = (
+                    json.loads(row[0]) if isinstance(row[0], str) else dict(row[0])
+                )
+
+            payload = update_payload(payloads)
+            payload["saved_at"] = datetime.now(ZoneInfo("Europe/Paris")).isoformat(
+                timespec="seconds"
+            )
+            cursor.execute(
+                """
+                UPDATE pro_consulting_settings
+                SET payload = %s::jsonb, updated_at = CURRENT_TIMESTAMP,
+                    updated_by = %s
+                WHERE scope = %s RETURNING payload
+                """,
+                (json.dumps(payload, ensure_ascii=False), updated_by, scope),
+            )
+            row = cursor.fetchone()
+            confirmed_payload = row[0] if row else None
+            if isinstance(confirmed_payload, str):
+                confirmed_payload = json.loads(confirmed_payload)
+            if confirmed_payload != payload:
+                raise RuntimeError("La base n’a pas confirmé la modification.")
+        connection.commit()
+
+    load_authorization_payloads.clear()
+    return confirmed_payload
+
+
+def update_collaborator_profiles(payloads, proposed_rows, create=False):
+    """Enregistre les profils actifs sans écraser les accès retirés."""
+    directory = build_collaborator_directory(payloads)
+    payload = dict(payloads[collaborator_access_scope()])
+    rows = list(payload.get("collaborators", []))
+    cleaned_rows = clean_collaborator_access_records(proposed_rows)
+    if len(cleaned_rows) != len(proposed_rows):
+        raise ValueError("Les informations du collaborateur sont incomplètes.")
+
+    for row in cleaned_rows:
+        email = row["email"]
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            raise ValueError("L’adresse e-mail indiquée n’est pas valide.")
+        if not row["groups"]:
+            raise ValueError("Attribuez au moins un groupe à chaque accès actif.")
+        access = directory.get(email)
+        if create:
+            if access:
+                raise ValueError("Cette adresse est déjà enregistrée dans les accès.")
+            rows.append({**row, "active": True})
+        else:
+            if not access or not access.get("managed_access") or not access["active"]:
+                raise ValueError("Un accès a changé. Actualisez la page avant d’enregistrer.")
+            rows = [
+                {**saved, **row, "active": True}
+                if isinstance(saved, dict) and normalize_email(saved.get("email")) == email
+                else saved
+                for saved in rows
+            ]
+    payload["collaborators"] = rows
+    return payload
+
+
+def change_collaborator_status(payloads, email, active, groups_if_empty=None):
+    """Retire ou rétablit l’accès sans supprimer la fiche du collaborateur."""
+    email = normalize_email(email)
+    directory = build_collaborator_directory(payloads)
+    access = directory.get(email)
+    if not access or access["role"] == "admin":
+        raise ValueError("Ce compte ne peut pas être retiré ni réactivé ici.")
+    if access["active"] == active:
+        raise ValueError("Le statut de ce compte a déjà changé. Actualisez la page.")
+
+    groups = access["groups"]
+    if active and access.get("managed_access") and not groups:
+        if not groups_if_empty:
+            raise ValueError("Choisissez au moins un groupe avant de réactiver cet accès.")
+        groups = list(groups_if_empty)
+    if active and access["role"] == "director":
+        restored_group_keys = {normalize_group_name(group) for group in groups}
+        restored_group_keys.discard("")
+        for other in directory.values():
+            if not other["active"] or other["role"] != "director":
+                continue
+            conflicts = restored_group_keys.intersection(
+                normalize_group_name(group) for group in other["groups"]
+            )
+            if conflicts:
+                conflicting_groups = ", ".join(
+                    group for group in groups if normalize_group_name(group) in conflicts
+                )
+                raise ValueError(
+                    f"Groupes déjà attribués à {other['name']} : {conflicting_groups}. "
+                    "Modifiez leur affectation avant de réactiver cet accès."
+                )
+
+    payload = dict(payloads[collaborator_access_scope()])
+    if access.get("managed_access"):
+        payload["collaborators"] = [
+            {**row, "active": active, **({"groups": groups} if active else {})}
+            if isinstance(row, dict) and normalize_email(row.get("email")) == email
+            else row
+            for row in payload.get("collaborators", [])
+        ]
+    else:
+        saved_archives = payload.get("archived_directors", [])
+        archived_directors = set(map(normalize_email, saved_archives))
+        if active:
+            archived_directors.discard(email)
+        else:
+            archived_directors.add(email)
+        payload["archived_directors"] = sorted(archived_directors)
+    return payload
 
 
 def default_director_management_config():
@@ -3354,7 +3524,7 @@ def normalize_group_name(value):
     return " ".join(normalized.split())
 
 
-def merge_director_group_assignments(payload, group_changes):
+def merge_director_group_assignments(payload, group_changes, archived_directors=()):
     """Modifie uniquement les groupes, en conservant les autres données."""
     payload = dict(payload or {})
     saved_directors = payload.get("directors", {})
@@ -3371,6 +3541,8 @@ def merge_director_group_assignments(payload, group_changes):
     for email, groups in group_changes.items():
         if email not in protected_emails or not isinstance(groups, list):
             raise ValueError("Affectation de direction invalide.")
+        if email in archived_directors:
+            raise ValueError("Une direction a été retirée. Actualisez la page.")
         row = dict(directors.get(email, {}))
         group_names = {}
         for group in groups:
@@ -3382,6 +3554,8 @@ def merge_director_group_assignments(payload, group_changes):
 
     group_owners = {}
     for email, row in directors.items():
+        if normalize_email(email) in archived_directors:
+            continue
         for group in row.get("groups", []):
             group_key = normalize_group_name(group)
             if not group_key:
@@ -3396,61 +3570,30 @@ def merge_director_group_assignments(payload, group_changes):
     return payload
 
 
-def save_director_group_assignments(database_url, group_changes, updated_by):
-    """Enregistre les affectations seules, sans écraser les montants saisis."""
-    admin_access = BASE_AUTHORIZED_USERS.get(normalize_email(updated_by), {})
-    if admin_access.get("role") != "admin":
-        raise PermissionError("Seul l’administrateur attribue les groupes.")
-
+def save_director_group_assignments(
+    database_url, group_changes, updated_by, financial_rows=None
+):
+    """Enregistre les affectations et les montants explicitement validés."""
     scope = director_management_scope()
-    with psycopg.connect(database_url) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO pro_consulting_settings (scope, payload, updated_by)
-                VALUES (%s, '{}'::jsonb, %s)
-                ON CONFLICT (scope) DO NOTHING
-                """,
-                (scope, updated_by),
-            )
-            cursor.execute(
-                """
-                SELECT payload FROM pro_consulting_settings
-                WHERE scope = %s FOR UPDATE
-                """,
-                (scope,),
-            )
-            row = cursor.fetchone()
-            saved_payload = row[0] if row else {}
-            if isinstance(saved_payload, str):
-                saved_payload = json.loads(saved_payload)
-            payload = merge_director_group_assignments(
-                saved_payload, group_changes
-            )
-            payload["saved_at"] = datetime.now(ZoneInfo("Europe/Paris")).isoformat(
-                timespec="seconds"
-            )
-            cursor.execute(
-                """
-                UPDATE pro_consulting_settings
-                SET payload = %s::jsonb, updated_at = CURRENT_TIMESTAMP,
-                    updated_by = %s
-                WHERE scope = %s RETURNING payload
-                """,
-                (json.dumps(payload, ensure_ascii=False), updated_by, scope),
-            )
-            confirmed_row = cursor.fetchone()
-            if not confirmed_row:
-                raise RuntimeError("La base n’a pas confirmé les affectations.")
-            confirmed_payload = confirmed_row[0]
-            if isinstance(confirmed_payload, str):
-                confirmed_payload = json.loads(confirmed_payload)
-            if confirmed_payload != payload:
-                raise RuntimeError("Les affectations enregistrées diffèrent.")
-        connection.commit()
+    def update(payloads):
+        directory = build_collaborator_directory(payloads)
+        archived_directors = {
+            email for email, access in directory.items()
+            if access["role"] == "director" and not access["active"]
+        }
+        payload = merge_director_group_assignments(
+            payloads[scope], group_changes, archived_directors
+        )
+        for email, row in (financial_rows or {}).items():
+            if email not in group_changes:
+                raise ValueError("Direction absente des affectations à enregistrer.")
+            payload["directors"][email].update({
+                "revenue_usd": row["revenue_usd"],
+                "other_expenses": row["other_expenses"],
+            })
+        return payload
 
-    load_authorization_payloads.clear()
-    return confirmed_payload
+    return update_authorization_scope(database_url, scope, updated_by, update)
 
 
 def queue_director_group_assignment(email, widget_key):
@@ -3634,14 +3777,14 @@ current_user_email = normalize_email(
 )
 database_url = get_database_url()
 AUTHORIZED_USERS, collaborator_access_load_error = build_authorized_users(
-    database_url
+    database_url, refresh=True
 )
 current_user_access = AUTHORIZED_USERS.get(current_user_email)
 
 if current_user_access is None:
     st.error(
-        "Accès refusé : cette adresse n’est pas autorisée à utiliser "
-        "Pro Consulting."
+        collaborator_access_load_error
+        or "Accès refusé : cette adresse n’est pas autorisée à utiliser Pro Consulting."
     )
     if current_user_email:
         st.code(current_user_email)
@@ -4112,6 +4255,11 @@ elif page == "💬 Chat collectif":
 
     @fragment_decorator
     def render_collective_chat_messages():
+        if current_user_role != "admin":
+            active_users, _ = build_authorized_users(database_url, refresh=True)
+            if active_users.get(current_user_email, {}).get("role") != current_user_role:
+                st.rerun()
+                return
         try:
             chat_messages = load_collective_chat_messages(database_url)
         except Exception:
@@ -5914,15 +6062,9 @@ elif page == "🔐 Accès collaborateurs":
 
     render_brand_hero(
         "Accès collaborateurs",
-        "Ajoutez les comptes autorisés, choisissez leur rôle et attribuez "
-        "leurs groupes. Cette page et ses réglages restent invisibles pour "
-        "tous les autres utilisateurs.",
+        "Gérez les accès des directeurs et responsables performance, "
+        "leurs rôles et leurs groupes.",
         "PRO CONSULTING • ADMINISTRATION PRIVÉE",
-    )
-    st.info(
-        "Les quatre directeurs déjà enregistrés conservent leurs accès. "
-        "Utilisez cette page pour ajouter et gérer les nouveaux "
-        "collaborateurs, notamment les responsables performance."
     )
 
     access_notice = st.session_state.pop(
@@ -5945,13 +6087,16 @@ elif page == "🔐 Accès collaborateurs":
     saved_access_payload = {}
     saved_director_payload = {}
     try:
-        authorization_payloads = load_authorization_payloads(database_url)
+        authorization_payloads = load_persistent_scopes(
+            database_url, (director_management_scope(), collaborator_access_scope())
+        )
         saved_access_payload = authorization_payloads[
             collaborator_access_scope()
         ]
         saved_director_payload = authorization_payloads[
             director_management_scope()
         ]
+        access_directory = build_collaborator_directory(authorization_payloads)
     except Exception:
         st.error(
             "Les accès enregistrés ne peuvent pas être chargés. Aucune "
@@ -5963,6 +6108,7 @@ elif page == "🔐 Accès collaborateurs":
     existing_access_rows = clean_collaborator_access_records(
         saved_access_payload.get("collaborators", [])
     )
+    active_added_rows = [row for row in existing_access_rows if row["active"]]
     known_group_values = set()
     if (
         st.session_state.backstage_data is not None
@@ -5997,9 +6143,124 @@ elif page == "🔐 Accès collaborateurs":
         st.warning(
             "Aucun groupe n’est encore disponible. Importez le fichier "
             "Backstage administrateur ou enregistrez d’abord les groupes "
-            "des quatre directions."
+            "des directions."
         )
 
+    def collaborator_label(email):
+        access = access_directory[email]
+        role = COLLABORATOR_ROLE_LABELS[access["role"]]
+        return f"{access['name']} — {role} — {email}"
+
+    def save_collaborator_status(email, active, groups_if_empty=None):
+        try:
+            update_authorization_scope(
+                database_url,
+                collaborator_access_scope(),
+                current_user_email,
+                lambda payloads: change_collaborator_status(
+                    payloads, email, active, groups_if_empty
+                ),
+            )
+        except ValueError as error:
+            st.warning(str(error))
+            return
+        except Exception:
+            st.error("Le changement d’accès n’a pas été enregistré. Réessayez.")
+            return
+
+        name = access_directory[email]["name"]
+        if not active:
+            st.session_state.get("pending_director_group_assignments", {}).pop(email, None)
+        notice = (
+            f"L’accès de {name} est réactivé."
+            if active else
+            f"L’accès de {name} est retiré. Sa fiche est dans les archives."
+        )
+        st.session_state.admin_collaborator_access_notice = ("success", notice)
+        st.rerun()
+
+    active_access_emails = sorted(
+        (email for email, access in access_directory.items()
+         if access["role"] != "admin" and access["active"]),
+        key=collaborator_label,
+    )
+    archived_access_emails = sorted(
+        (email for email, access in access_directory.items()
+         if access["role"] != "admin" and not access["active"]),
+        key=collaborator_label,
+    )
+
+    st.subheader("Retirer un accès")
+    st.caption(
+        "Le compte est bloqué et masqué des listes actives. Ses données "
+        "et réglages restent enregistrés dans le logiciel."
+    )
+    if active_access_emails:
+        email_to_archive = st.selectbox(
+            "Directeur ou responsable performance à retirer",
+            options=active_access_emails,
+            index=None,
+            format_func=collaborator_label,
+            placeholder="Choisir un collaborateur",
+            key="archive_collaborator_email",
+        )
+        if email_to_archive in active_access_emails:
+            if access_directory[email_to_archive]["role"] == "director":
+                st.caption(
+                    "Cette direction sera retirée des estimations courantes. "
+                    "Les chiffres déjà saisis restent enregistrés."
+                )
+            confirm_archive = st.checkbox(
+                f"Je confirme le retrait de {access_directory[email_to_archive]['name']}.",
+                key=f"confirm_archive_{email_to_archive}",
+            )
+            if st.button(
+                "Retirer l’accès",
+                key="archive_collaborator_access",
+                disabled=not confirm_archive,
+                use_container_width=True,
+            ):
+                save_collaborator_status(email_to_archive, active=False)
+    else:
+        st.info("Aucun accès collaborateur actif.")
+
+    with st.expander(f"Accès retirés ({len(archived_access_emails)})"):
+        if not archived_access_emails:
+            st.caption("Aucun compte retiré.")
+        else:
+            email_to_restore = st.selectbox(
+                "Compte à réactiver",
+                options=archived_access_emails,
+                index=None,
+                format_func=collaborator_label,
+                placeholder="Choisir un compte archivé",
+                key="restore_collaborator_email",
+            )
+            if email_to_restore in archived_access_emails:
+                archived_access = access_directory[email_to_restore]
+                restore_groups = None
+                needs_groups = bool(
+                    archived_access.get("managed_access") and not archived_access["groups"]
+                )
+                if archived_access["groups"]:
+                    st.caption("Groupes enregistrés : " + ", ".join(archived_access["groups"]))
+                elif needs_groups:
+                    restore_groups = st.multiselect(
+                        "Groupes à attribuer à la réactivation",
+                        options=available_access_groups,
+                        key=f"restore_groups_{email_to_restore}",
+                    )
+                if st.button(
+                    "Réactiver l’accès",
+                    key="restore_collaborator_access",
+                    disabled=needs_groups and not restore_groups,
+                    use_container_width=True,
+                ):
+                    save_collaborator_status(
+                        email_to_restore, active=True, groups_if_empty=restore_groups
+                    )
+
+    st.divider()
     known_authorized_emails = set(BASE_AUTHORIZED_USERS)
     known_authorized_emails.update(
         row["email"] for row in existing_access_rows
@@ -6090,14 +6351,17 @@ elif page == "🔐 Accès collaborateurs":
         elif not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized_new_email):
             validation_error = "L’adresse e-mail indiquée n’est pas valide."
         elif normalized_new_email in known_authorized_emails:
-            validation_error = "Cette adresse possède déjà un accès."
+            validation_error = (
+                "Cette adresse est déjà enregistrée. Pour un compte retiré, "
+                "utilisez « Accès retirés »."
+            )
         elif not new_collaborator_groups:
             validation_error = "Attribuez au moins un groupe."
 
         if validation_error:
             st.warning(validation_error)
         else:
-            updated_access_rows = existing_access_rows + [
+            new_access_rows = [
                 {
                     "email": normalized_new_email,
                     "name": str(new_collaborator_name).strip(),
@@ -6107,17 +6371,13 @@ elif page == "🔐 Accès collaborateurs":
                 }
             ]
             try:
-                save_persistent_scopes(
+                update_authorization_scope(
                     database_url,
-                    {
-                        collaborator_access_scope(): {
-                            "collaborators": updated_access_rows,
-                            "saved_at": datetime.now().isoformat(
-                                timespec="seconds"
-                            ),
-                        }
-                    },
+                    collaborator_access_scope(),
                     current_user_email,
+                    lambda payloads: update_collaborator_profiles(
+                        payloads, new_access_rows, create=True
+                    ),
                 )
                 st.session_state.admin_collaborator_access_notice = (
                     "success",
@@ -6129,6 +6389,8 @@ elif page == "🔐 Accès collaborateurs":
                     None,
                 )
                 st.rerun()
+            except ValueError as error:
+                st.warning(str(error))
             except Exception:
                 st.error(
                     "L’accès n’a pas été enregistré. Le collaborateur "
@@ -6136,16 +6398,16 @@ elif page == "🔐 Accès collaborateurs":
                 )
 
     st.divider()
-    st.subheader("Collaborateurs ajoutés")
-    if not existing_access_rows:
+    st.subheader("Collaborateurs ajoutés actifs")
+    if not active_added_rows:
         st.caption(
-            "Aucun collaborateur supplémentaire n’a encore été ajouté."
+            "Aucun collaborateur supplémentaire actif."
         )
     else:
         role_labels = list(COLLABORATOR_ROLE_LABELS.values())
         edited_access_rows = []
-        for access_index, access_row in enumerate(existing_access_rows):
-            safe_access_key = safe_export_name(access_row["email"])
+        for access_row in active_added_rows:
+            safe_access_key = hashlib.sha256(access_row["email"].encode()).hexdigest()[:16]
             with st.expander(
                 f"{access_row['name']} — {access_row['email']}",
                 expanded=True,
@@ -6154,13 +6416,13 @@ elif page == "🔐 Accès collaborateurs":
                 edited_name = edit_name_column.text_input(
                     "Nom affiché",
                     value=access_row["name"],
-                    key=f"collaborator_name_{safe_access_key}_{access_index}",
+                    key=f"collaborator_name_{safe_access_key}",
                 )
                 edit_email_column.text_input(
                     "Adresse Google",
                     value=access_row["email"],
                     disabled=True,
-                    key=f"collaborator_email_{safe_access_key}_{access_index}",
+                    key=f"collaborator_email_{safe_access_key}",
                 )
                 edit_role_column, edit_groups_column = st.columns(2)
                 current_role_label = COLLABORATOR_ROLE_LABELS[
@@ -6170,7 +6432,7 @@ elif page == "🔐 Accès collaborateurs":
                     "Rôle",
                     options=role_labels,
                     index=role_labels.index(current_role_label),
-                    key=f"collaborator_role_{safe_access_key}_{access_index}",
+                    key=f"collaborator_role_{safe_access_key}",
                 )
                 edited_groups = edit_groups_column.multiselect(
                     "Groupes attribués",
@@ -6180,16 +6442,7 @@ elif page == "🔐 Accès collaborateurs":
                         for group in access_row["groups"]
                         if group in available_access_groups
                     ],
-                    key=f"collaborator_groups_{safe_access_key}_{access_index}",
-                )
-                edited_active = st.toggle(
-                    "Accès actif",
-                    value=bool(access_row["active"]),
-                    key=f"collaborator_active_{safe_access_key}_{access_index}",
-                    help=(
-                        "Désactivez cette option pour bloquer immédiatement "
-                        "la prochaine ouverture de l’application."
-                    ),
+                    key=f"collaborator_groups_{safe_access_key}",
                 )
             edited_access_rows.append(
                 {
@@ -6200,7 +6453,7 @@ elif page == "🔐 Accès collaborateurs":
                         for role, label in COLLABORATOR_ROLE_LABELS.items()
                     }[edited_role_label],
                     "groups": list(edited_groups),
-                    "active": bool(edited_active),
+                    "active": True,
                 }
             )
 
@@ -6223,24 +6476,21 @@ elif page == "🔐 Accès collaborateurs":
                 )
             else:
                 try:
-                    save_persistent_scopes(
+                    update_authorization_scope(
                         database_url,
-                        {
-                            collaborator_access_scope(): {
-                                "collaborators": edited_access_rows,
-                                "saved_at": datetime.now().isoformat(
-                                    timespec="seconds"
-                                ),
-                            }
-                        },
+                        collaborator_access_scope(),
                         current_user_email,
+                        lambda payloads: update_collaborator_profiles(
+                            payloads, edited_access_rows
+                        ),
                     )
                     st.session_state.admin_collaborator_access_notice = (
                         "success",
-                        "Les rôles, groupes et statuts ont été enregistrés "
-                        "définitivement.",
+                        "Les rôles et groupes ont été enregistrés.",
                     )
                     st.rerun()
+                except ValueError as error:
+                    st.warning(str(error))
                 except Exception:
                     st.error(
                         "La modification n’a pas été enregistrée. Les droits "
@@ -7593,11 +7843,21 @@ elif page == "🏢 Directeur de branche":
     )
 
     if current_user_role == "admin":
+        director_profiles = active_director_profiles(AUTHORIZED_USERS)
+        if not director_profiles:
+            if not collaborator_access_load_error:
+                st.info(
+                    "Aucune direction active à afficher. Les comptes retirés "
+                    "peuvent être réactivés dans « Accès collaborateurs »."
+                )
+            else:
+                st.error(collaborator_access_load_error)
+            st.stop()
+
         st.info(
-            "Cet espace privé vous permet d’affecter les groupes aux "
-            "quatre directeurs et d’afficher leurs factures en une seule "
-            "fois. Les changements de groupes sont enregistrés automatiquement "
-            "et sécurisent aussi leurs imports : un "
+            "Affectez les groupes aux directions actives et consultez leurs "
+            "estimations de paiement. Les changements de groupes sont "
+            "enregistrés automatiquement et sécurisent leurs imports : un "
             "groupe manquant ou non autorisé bloque entièrement le fichier. "
             "Les directeurs ne voient pas cette vue d’ensemble."
         )
@@ -7663,7 +7923,7 @@ elif page == "🏢 Directeur de branche":
         st.caption(
             "Les groupes attribués restent enregistrés même s’ils sont "
             "absents de l’export actuel. Pour les chiffres d’affaires et "
-            "dépenses, utilisez « Enregistrer les quatre directions »."
+            "dépenses, utilisez « Enregistrer les directions actives »."
         )
         edited_director_config = {}
         pending_group_assignments = st.session_state.get(
@@ -7673,7 +7933,7 @@ elif page == "🏢 Directeur de branche":
             "admin_director_group_versions", {}
         )
 
-        for profile in DIRECTOR_MANAGEMENT_PROFILES:
+        for profile in director_profiles:
             email = profile["email"]
             saved_row = saved_director_config[email]
             key_suffix = re.sub(r"[^a-z0-9]+", "_", profile["name"].lower())
@@ -7746,7 +8006,7 @@ elif page == "🏢 Directeur de branche":
 
         group_owners = {}
         group_labels = {}
-        for profile in DIRECTOR_MANAGEMENT_PROFILES:
+        for profile in director_profiles:
             for group in edited_director_config[profile["email"]]["groups"]:
                 group_key = normalize_group_name(group)
                 group_labels.setdefault(group_key, group)
@@ -7769,9 +8029,14 @@ elif page == "🏢 Directeur de branche":
                 f"Corrigez les doublons suivants : {duplicate_details}."
             )
 
-        group_changes = st.session_state.get(
-            "pending_director_group_assignments", {}
-        )
+        group_changes = {
+            email: groups
+            for email, groups in st.session_state.get(
+                "pending_director_group_assignments", {}
+            ).items()
+            if email in edited_director_config
+        }
+        st.session_state.pending_director_group_assignments = group_changes
         if group_changes and not duplicate_groups:
             if not persistent_settings_available:
                 st.error(
@@ -7809,7 +8074,7 @@ elif page == "🏢 Directeur de branche":
             st.rerun()
 
         save_director_config = st.button(
-            "💾 Enregistrer les quatre directions",
+            "💾 Enregistrer les directions actives",
             key="save_admin_director_management",
             type="primary",
             use_container_width=True,
@@ -7818,41 +8083,27 @@ elif page == "🏢 Directeur de branche":
         if save_director_config:
             if persistent_settings_available:
                 try:
-                    director_payload_to_save = merge_director_group_assignments(
-                        load_persistent_scope(
-                            database_url, director_management_scope()
-                        ),
+                    confirmed_director_payload = save_director_group_assignments(
+                        database_url,
                         {
                             email: row["groups"]
                             for email, row in edited_director_config.items()
                         },
-                    )
-                    for email, row in edited_director_config.items():
-                        director_payload_to_save["directors"][email].update(row)
-                    director_payload_to_save["saved_at"] = datetime.now().isoformat(
-                        timespec="seconds"
-                    )
-                    save_persistent_scopes(
-                        database_url,
-                        {
-                            director_management_scope(): director_payload_to_save
-                        },
                         current_user_email,
+                        financial_rows=edited_director_config,
                     )
-                    confirmed_director_payload = load_persistent_scope(
-                        database_url, director_management_scope()
-                    )
-                    if confirmed_director_payload != director_payload_to_save:
-                        raise RuntimeError(
-                            "La base n’a pas confirmé les quatre directions."
-                        )
                     st.session_state.admin_director_management_config = (
-                        edited_director_config
+                        clean_director_management_config(
+                            confirmed_director_payload.get("directors", {}),
+                            available_groups,
+                        )
                     )
                     st.success(
                         "Les groupes, chiffres d’affaires et dépenses des "
-                        "quatre directions sont enregistrés définitivement."
+                        "directions actives sont enregistrés."
                     )
+                except ValueError as error:
+                    st.warning(str(error))
                 except Exception:
                     st.error(
                         "Les valeurs restent utilisables dans cette session, "
@@ -7875,6 +8126,7 @@ elif page == "🏢 Directeur de branche":
             all_creator_results=all_creator_results,
             director_config=edited_director_config,
             usd_to_eur=director_rate_info["rate"],
+            director_profiles=director_profiles,
         )
         saved_director_modes = st.session_state.payment_preferences.get(
             "directors",
@@ -7892,7 +8144,7 @@ elif page == "🏢 Directeur de branche":
             "Montant facture directeur (€)"
         ]
         st.divider()
-        st.subheader("Vue d’ensemble des quatre directeurs")
+        st.subheader("Vue d’ensemble des directions actives")
         overview1, overview2, overview3, overview4 = st.columns(4)
         overview1.metric(
             "Groupes attribués",
@@ -7911,6 +8163,9 @@ elif page == "🏢 Directeur de branche":
             f"{director_overview.loc[director_overview['Mode paiement'] == 'Facture €', 'Montant facture (€)'].sum():,.2f} €",
         )
 
+        director_roster_key = hashlib.sha256(
+            "|".join(profile["email"] for profile in director_profiles).encode()
+        ).hexdigest()[:16]
         edited_director_overview = st.data_editor(
             director_overview,
             use_container_width=True,
@@ -7966,7 +8221,7 @@ elif page == "🏢 Directeur de branche":
                     format="%.2f €"
                 ),
             },
-            key="admin_director_payment_editor",
+            key=f"admin_director_payment_editor_{director_roster_key}",
         )
         if st.button(
             "💾 Enregistrer les modes de paiement des directeurs",
@@ -7976,8 +8231,11 @@ elif page == "🏢 Directeur de branche":
             disabled=not persistent_settings_available,
         ):
             st.session_state.payment_preferences["directors"] = {
-                payment_entity_key(row["Directeur"]): row["Mode paiement"]
-                for row in edited_director_overview.to_dict("records")
+                **saved_director_modes,
+                **{
+                    payment_entity_key(row["Directeur"]): row["Mode paiement"]
+                    for row in edited_director_overview.to_dict("records")
+                },
             }
             try:
                 persist_payment_preferences(
@@ -7999,10 +8257,10 @@ elif page == "🏢 Directeur de branche":
         ]
         show_excel_download(
             director_overview,
-            table_name="factures_quatre_directeurs",
+            table_name="factures_directions_actives",
             sheet_name="Factures directeurs",
-            key="download_four_directors_overview",
-            label="⬇️ Télécharger la vue des quatre directeurs (Excel)",
+            key="download_active_directors_overview",
+            label="⬇️ Télécharger la vue des directions actives (Excel)",
         )
         st.caption(
             "Les montants sont recalculés avec le taux BCE affiché et le "
@@ -8515,10 +8773,11 @@ elif page == "💰 Bénéfice agence":
         st.session_state.admin_director_management_config,
         available_agency_groups,
     )
+    benefit_director_profiles = active_director_profiles(AUTHORIZED_USERS)
     benefit_group_owners = {}
-    for profile in DIRECTOR_MANAGEMENT_PROFILES:
+    for profile in benefit_director_profiles:
         for group in benefit_director_config[profile["email"]]["groups"]:
-            benefit_group_owners.setdefault(group, []).append(
+            benefit_group_owners.setdefault(normalize_group_name(group), set()).add(
                 profile["name"]
             )
     benefit_has_duplicate_groups = any(
@@ -8549,6 +8808,7 @@ elif page == "💰 Bénéfice agence":
             all_creator_results=agency_creators,
             director_config=benefit_director_config,
             usd_to_eur=agency_rate_info["rate"],
+            director_profiles=benefit_director_profiles,
         )
         directors_reward = float(
             agency_director_overview[
@@ -8556,7 +8816,13 @@ elif page == "💰 Bénéfice agence":
             ].sum()
         )
         agency_profit = result_before_directors - directors_reward
-        director_invoice_source = "Factures calculées des quatre directions"
+        director_invoice_source = "Factures calculées des directions actives"
+    elif not collaborator_access_load_error and not any(
+        access["role"] == "director" for access in AUTHORIZED_USERS.values()
+    ):
+        directors_reward = 0.0
+        agency_profit = result_before_directors
+        director_invoice_source = "Aucune direction active"
     else:
         directors_reward = agency_calculation["directors_reward"]
         agency_profit = agency_calculation["agency_profit"]
@@ -8696,7 +8962,7 @@ elif page == "💰 Bénéfice agence":
         agency_director_invoices = pd.DataFrame(
             [
                 {
-                    "Directeur": "Estimation globale",
+                    "Directeur": director_invoice_source,
                     "Montant facture directeur (€)": directors_reward,
                 }
             ]

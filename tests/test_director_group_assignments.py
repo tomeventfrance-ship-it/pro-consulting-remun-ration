@@ -32,6 +32,9 @@ def load_functions():
     names = {
         "normalize_email", "director_management_scope", "collaborator_access_scope",
         "clean_collaborator_access_records", "build_authorized_users",
+        "build_collaborator_directory", "active_director_profiles",
+        "update_authorization_scope", "update_collaborator_profiles",
+        "change_collaborator_status", "send_collective_chat_push_notifications",
         "default_director_management_config", "clean_director_management_config",
         "normalize_group_name", "merge_director_group_assignments",
         "save_director_group_assignments", "queue_director_group_assignment",
@@ -71,40 +74,54 @@ class FakeCursor:
 
     def execute(self, query, parameters):
         self.database.queries.append(query)
-        if "SELECT payload" in query:
-            self.response = (copy.deepcopy(self.database.working),)
+        self.database.parameters.append(parameters)
+        if "INSERT INTO pro_consulting_settings" in query:
+            self.database.working.setdefault(parameters[0], {})
+        elif "SELECT payload" in query:
+            self.response = (copy.deepcopy(self.database.working[parameters[0]]),)
         elif "UPDATE pro_consulting_settings" in query:
-            self.database.working = json.loads(parameters[0])
+            scope = parameters[2]
+            self.database.working[scope] = json.loads(parameters[0])
             self.response = (
                 None if self.database.fail_confirmation
-                else (copy.deepcopy(self.database.working),)
+                else (copy.deepcopy(self.database.working[scope]),)
             )
 
     def fetchone(self):
         return self.response
 
+    def fetchall(self):
+        return []
+
 
 class FakeDatabase:
-    def __init__(self, payload, fail_confirmation=False):
-        self.payload = copy.deepcopy(payload)
-        self.working = copy.deepcopy(payload)
+    def __init__(self, payload, fail_confirmation=False, scopes=None):
+        self.scopes = copy.deepcopy(
+            scopes if scopes is not None else {"admin:director_management": payload}
+        )
+        self.working = copy.deepcopy(self.scopes)
         self.fail_confirmation = fail_confirmation
         self.queries = []
+        self.parameters = []
         self.committed = False
+
+    @property
+    def payload(self):
+        return self.scopes["admin:director_management"]
 
     def __enter__(self):
         return self
 
     def __exit__(self, exception_type, *args):
         if exception_type:
-            self.working = copy.deepcopy(self.payload)
+            self.working = copy.deepcopy(self.scopes)
         return False
 
     def cursor(self):
         return FakeCursor(self)
 
     def commit(self):
-        self.payload = copy.deepcopy(self.working)
+        self.scopes = copy.deepcopy(self.working)
         self.committed = True
 
 
