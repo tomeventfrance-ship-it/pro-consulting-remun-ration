@@ -8847,6 +8847,12 @@ elif page == "💰 Bénéfice agence":
         available_agency_groups,
     )
     benefit_director_profiles = active_director_profiles(AUTHORIZED_USERS)
+    if len(benefit_director_profiles) > 1:
+        st.warning(
+            "Plusieurs accès directeur sont encore actifs. "
+            "Désactivez les anciens accès dans l'administration pour "
+            "appliquer le calcul du directeur unique sur le bénéfice global."
+        )
     benefit_group_owners = {}
     for profile in benefit_director_profiles:
         for group in benefit_director_config[profile["email"]]["groups"]:
