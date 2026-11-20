@@ -3033,14 +3033,28 @@ def build_director_overview(
     for profile in director_profiles:
         email = profile["email"]
         direction_config = director_config[email]
-        selected_groups = direction_config["groups"]
+        unique_director = len(director_profiles) == 1
+        # Avec un directeur unique, l'affectation des groupes ne limite
+        # plus l'assiette de sa rémunération (sans changer les accès).
+        selected_groups = (
+            all_creator_results["Groupe"].fillna("").unique().tolist()
+            if unique_director else direction_config["groups"]
+        )
+        total_revenue_usd = (
+            float(st.session_state.revenue_usd)
+            if unique_director else direction_config["revenue_usd"]
+        )
+        total_other_expenses = (
+            float(st.session_state.other_expenses)
+            if unique_director else direction_config["other_expenses"]
+        )
 
-        if selected_groups:
+        if unique_director or selected_groups:
             branch_result = calculate_director_branch_finances(
                 all_creator_results=all_creator_results,
                 selected_groups=selected_groups,
-                revenue_usd=direction_config["revenue_usd"],
-                other_expenses=direction_config["other_expenses"],
+                revenue_usd=total_revenue_usd,
+                other_expenses=total_other_expenses,
                 usd_to_eur=usd_to_eur,
             )
         else:
@@ -3061,9 +3075,12 @@ def build_director_overview(
             {
                 "Directeur": profile["name"],
                 "Direction": profile["direction"],
-                "Groupes gérés": ", ".join(selected_groups) or "Aucun",
+                "Groupes gérés": (
+                    "Ensemble de la structure"
+                    if unique_director else ", ".join(selected_groups) or "Aucun"
+                ),
                 "Diamants générés": branch_result["diamonds_generated"],
-                "CA branche ($)": direction_config["revenue_usd"],
+                "CA branche ($)": total_revenue_usd,
                 "CA converti (€)": branch_result["revenue_eur"],
                 "Charges (€)": branch_result["charges_eur"],
                 "Coût créateurs (€)": branch_result["creator_cost"],
@@ -3071,9 +3088,7 @@ def build_director_overview(
                 "Coût responsables (€)": branch_result[
                     "responsable_cost"
                 ],
-                "Autres dépenses (€)": direction_config[
-                    "other_expenses"
-                ],
+                "Autres dépenses (€)": total_other_expenses,
                 "Bénéfice avant directeur (€)": branch_result[
                     "net_profit_before_director"
                 ],
@@ -8157,6 +8172,14 @@ elif page == "🏢 Directeur de branche":
         ]
         st.divider()
         st.subheader("Vue d’ensemble des directions actives")
+        if len(director_profiles) == 1:
+            st.info(
+                "Directeur unique : le CA global, les charges et les "
+                "autres dépenses sont repris des paramètres de l'agence. "
+                "L'export Backstage doit contenir tous les groupes et "
+                "les dépenses des tournois et récompenses doivent être "
+                "incluses dans les autres dépenses."
+            )
         overview1, overview2, overview3, overview4 = st.columns(4)
         overview1.metric(
             "Groupes attribués",
@@ -8275,9 +8298,10 @@ elif page == "🏢 Directeur de branche":
             label="⬇️ Télécharger la vue des directions actives (Excel)",
         )
         st.caption(
-            "Les montants sont recalculés avec le taux BCE affiché et le "
-            "palier Directeur enregistré. Un directeur sans groupe attribué "
-            "reste à 0 € afin d’éviter une facture sans équipe rattachée."
+            "Les montants sont recalculés avec le taux BCE et le palier "
+            "Directeur enregistré. En direction unique, la commission porte "
+            "sur le bénéfice total avant directeur, même si aucun groupe "
+            "n'est attribué. Les affectations gèrent les accès aux imports."
         )
         st.stop()
 
