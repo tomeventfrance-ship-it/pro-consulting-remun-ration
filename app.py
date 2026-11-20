@@ -3480,13 +3480,21 @@ def change_collaborator_status(payloads, email, active, groups_if_empty=None):
 
 
 def default_director_management_config():
+    """Inclut les directions historiques et les nouveaux accès actifs."""
+    emails = [profile["email"] for profile in DIRECTOR_MANAGEMENT_PROFILES]
+    emails.extend(
+        profile["email"]
+        for profile in active_director_profiles(
+            globals().get("AUTHORIZED_USERS", {})
+        )
+    )
     return {
-        profile["email"]: {
+        email: {
             "groups": [],
             "revenue_usd": 0.0,
             "other_expenses": 0.0,
         }
-        for profile in DIRECTOR_MANAGEMENT_PROFILES
+        for email in dict.fromkeys(emails)
     }
 
 
@@ -3506,8 +3514,7 @@ def clean_director_management_config(payload, available_groups):
     payload = payload if isinstance(payload, dict) else {}
     cleaned_config = default_director_management_config()
 
-    for profile in DIRECTOR_MANAGEMENT_PROFILES:
-        email = profile["email"]
+    for email in cleaned_config:
         saved_row = payload.get(email, {})
         saved_row = saved_row if isinstance(saved_row, dict) else {}
         saved_groups = saved_row.get("groups", [])
