@@ -766,7 +766,7 @@ DEFAULT_VALUES = {
     "creator_level": 9,
     "consultant_level": 9,
     "manager_level": 9,
-    "director_level": 8,
+    "director_level": 4,
     "revenue_usd": 0.0,
     "usd_to_eur": 0.92,
     "other_expenses": 0.0,
@@ -2799,15 +2799,28 @@ RESPONSABLE_RATES = {
     13: 0.025,
 }
 
+# Pourcentage du bénéfice global positif avant commission du directeur.
 DIRECTOR_RATES = {
-    4: 0.04,
-    5: 0.05,
-    7: 0.07,
-    8: 0.09,
-    10: 0.11,
-    11: 0.13,
-    13: 0.15,
+    4: 0.06,
+    5: 0.07,
+    7: 0.09,
+    9: 0.13,
+    10: 0.15,
+    13: 0.22,
 }
+
+
+def director_rate_for_performance(level):
+    """Prend le dernier palier atteint, sans commission sous 4 %."""
+    matched = [threshold for threshold in DIRECTOR_RATES if threshold <= int(level)]
+    return DIRECTOR_RATES[max(matched)] if matched else 0.0
+
+
+def director_level_for_selector(level):
+    """Compatibilité des anciens paramètres sauvegardés (8 %, 11 %)."""
+    matched = [threshold for threshold in DIRECTOR_RATES if threshold <= int(level)]
+    return max(matched) if matched else min(DIRECTOR_RATES)
+
 
 
 def calculate_agency_profit(
@@ -2986,10 +2999,7 @@ def calculate_director_branch_finances(
         - responsable_cost
         - float(other_expenses),
     )
-    director_rate = DIRECTOR_RATES.get(
-        int(st.session_state.director_level),
-        0.0,
-    )
+    director_rate = director_rate_for_performance(st.session_state.director_level)
     director_reward = net_profit_before_director * director_rate
 
     return {
@@ -3042,10 +3052,7 @@ def build_director_overview(
                 "consultant_cost": 0.0,
                 "responsable_cost": 0.0,
                 "net_profit_before_director": 0.0,
-                "director_rate": DIRECTOR_RATES.get(
-                    int(st.session_state.director_level),
-                    0.0,
-                ),
+                "director_rate": director_rate_for_performance(st.session_state.director_level),
                 "director_reward": 0.0,
                 "remaining_after_director": 0.0,
             }
@@ -5729,13 +5736,18 @@ elif page == "⚙️ Paramètres":
                 ),
                 disabled=parameters_locked,
             )
+            director_levels = list(DIRECTOR_RATES)
             director_level = st.selectbox(
-                "Palier Directeur atteint",
-                [4, 5, 7, 8, 10, 11, 13],
-                index=[4, 5, 7, 8, 10, 11, 13].index(
-                    int(st.session_state.director_level)
+                "Performance collective TikTok (palier directeur)",
+                director_levels,
+                index=director_levels.index(
+                    director_level_for_selector(st.session_state.director_level)
                 ),
                 disabled=parameters_locked,
+                help=(
+                    "Taux du directeur appliqué au bénéfice global après "
+                    "les autres charges et avant sa propre commission."
+                ),
             )
 
         st.subheader("Paramètres financiers")
@@ -8426,10 +8438,7 @@ elif page == "🏢 Directeur de branche":
         - responsable_cost
         - branch_other_expenses,
     )
-    director_rate = DIRECTOR_RATES.get(
-        int(st.session_state.director_level),
-        0.0,
-    )
+    director_rate = director_rate_for_performance(st.session_state.director_level)
     director_reward = net_profit_before_director * director_rate
     remaining_after_director = (
         net_profit_before_director - director_reward
@@ -8735,10 +8744,7 @@ elif page == "💰 Bénéfice agence":
         else 0.0
     )
     agency_other_expenses = float(st.session_state.other_expenses)
-    director_rate = DIRECTOR_RATES.get(
-        int(st.session_state.director_level),
-        0.0,
-    )
+    director_rate = director_rate_for_performance(st.session_state.director_level)
 
     available_agency_groups = sorted(
         value
@@ -8803,7 +8809,15 @@ elif page == "💰 Bénéfice agence":
         "result_before_directors"
     ]
     agency_director_overview = pd.DataFrame()
-    if benefit_has_director_assignments:
+    if len(benefit_director_profiles) == 1:
+        # Directeur unique : une seule commission calculée sur le bénéfice
+        # global, jamais la somme de simulations de branches.
+        directors_reward = agency_calculation["directors_reward"]
+        agency_profit = agency_calculation["agency_profit"]
+        director_invoice_source = (
+            "Directeur unique : bénéfice total de la structure"
+        )
+    elif benefit_has_director_assignments:
         agency_director_overview = build_director_overview(
             all_creator_results=agency_creators,
             director_config=benefit_director_config,
@@ -8891,9 +8905,11 @@ elif page == "💰 Bénéfice agence":
         )
 
     st.caption(
-        "Lorsque les groupes des quatre directeurs sont enregistrés, leurs "
-        "factures individuelles remplacent l’estimation globale dans ce "
-        "calcul. Le taux BCE ne modifie jamais la valeur facture par diamant."
+        "Avec un directeur unique, la commission est calculée une seule "
+        "fois sur le bénéfice global de Pro Consulting avant sa rémunération. "
+        "Les dépenses de tournois et récompenses doivent être renseignées "
+        "dans « Autres dépenses » si elles ne sont pas déjà déduites. "
+        "Le taux BCE ne modifie jamais la valeur facture par diamant."
     )
 
     agency_summary = pd.DataFrame(
