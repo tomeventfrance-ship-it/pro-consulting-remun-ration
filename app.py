@@ -8305,16 +8305,25 @@ elif page == "🏢 Directeur de branche":
         )
         st.stop()
 
-    st.subheader("Composition de la branche")
+    unique_director = len(active_director_profiles(AUTHORIZED_USERS)) == 1
+    if unique_director:
+        st.subheader("Toutes les équipes de Pro Consulting")
+        st.warning(
+            "Le calcul du directeur unique exige un export Backstage "
+            "complet de la structure. Un export limité à une branche "
+            "fausserait sa rémunération. Le chiffre d'affaires et les "
+            "dépenses communs sont définis par le fondateur."
+        )
+        st.session_state["director_selected_groups"] = available_groups
+    else:
+        st.subheader("Composition de la branche")
     selected_groups = st.multiselect(
-        "Cochez les responsables performance appartenant à cette branche",
+        "Équipes de la direction",
         options=available_groups,
         default=available_groups,
-        help=(
-            "Si l’export contient uniquement la branche du directeur, "
-            "laissez tous les responsables cochés."
-        ),
+        help="Toutes les équipes sont obligatoires pour le directeur unique.",
         key="director_selected_groups",
+        disabled=unique_director,
     )
 
     if not selected_groups:
@@ -8373,23 +8382,33 @@ elif page == "🏢 Directeur de branche":
         "par la banque."
     )
 
-    input1, input2 = st.columns(2)
-    revenue_usd = input1.number_input(
-        "Chiffre d’affaires Backstage de la branche ($)",
-        min_value=0.0,
-        value=float(st.session_state.director_branch_revenue_usd),
-        step=100.0,
-        key="director_revenue_input",
-    )
-    branch_other_expenses = input2.number_input(
-        "Autres dépenses propres à la branche (€)",
-        min_value=0.0,
-        value=float(st.session_state.director_branch_other_expenses),
-        step=10.0,
-        key="director_expenses_input",
-    )
-    st.session_state.director_branch_revenue_usd = revenue_usd
-    st.session_state.director_branch_other_expenses = branch_other_expenses
+    if unique_director:
+        revenue_usd = float(st.session_state.revenue_usd)
+        branch_other_expenses = float(st.session_state.other_expenses)
+        input1, input2 = st.columns(2)
+        input1.metric("Chiffre d'affaires global ($)", f"{revenue_usd:,.2f} $")
+        input2.metric(
+            "Autres dépenses globales (€)",
+            f"{branch_other_expenses:,.2f} €",
+        )
+    else:
+        input1, input2 = st.columns(2)
+        revenue_usd = input1.number_input(
+            "Chiffre d’affaires Backstage de la branche ($)",
+            min_value=0.0,
+            value=float(st.session_state.director_branch_revenue_usd),
+            step=100.0,
+            key="director_revenue_input",
+        )
+        branch_other_expenses = input2.number_input(
+            "Autres dépenses propres à la branche (€)",
+            min_value=0.0,
+            value=float(st.session_state.director_branch_other_expenses),
+            step=10.0,
+            key="director_expenses_input",
+        )
+        st.session_state.director_branch_revenue_usd = revenue_usd
+        st.session_state.director_branch_other_expenses = branch_other_expenses
 
     branch_creators = all_creator_results[
         all_creator_results["Groupe"].isin(selected_groups)
@@ -8509,7 +8528,10 @@ elif page == "🏢 Directeur de branche":
     )
 
     st.divider()
-    st.subheader("Résultat de la branche")
+    st.subheader(
+        "Résultat global Pro Consulting"
+        if unique_director else "Résultat de la branche"
+    )
     result1, result2, result3, result4 = st.columns(4)
     result1.metric("CA converti", f"{revenue_eur:,.2f} €")
     result2.metric(
@@ -8562,7 +8584,11 @@ elif page == "🏢 Directeur de branche":
             ("Rémunérations créateurs", -creator_cost),
             ("Rémunérations consultants", -consultant_cost),
             ("Rémunérations responsables performance", -responsable_cost),
-            ("Autres dépenses de la branche", -branch_other_expenses),
+            (
+                "Autres dépenses de la structure"
+                if unique_director else "Autres dépenses de la branche",
+                -branch_other_expenses,
+            ),
             ("Bénéfice avant directeur", net_profit_before_director),
             ("Rémunération du directeur", -director_reward),
             ("Bénéfice restant", remaining_after_director),
