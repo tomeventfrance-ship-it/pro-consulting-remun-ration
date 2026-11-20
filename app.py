@@ -3317,11 +3317,21 @@ DIRECTOR_MANAGEMENT_PROFILES = (
 
 
 def active_director_profiles(authorized_users):
-    """Les directions d’origine encore actives dans les vues de gestion."""
-    return tuple(
-        profile for profile in DIRECTOR_MANAGEMENT_PROFILES
-        if authorized_users.get(profile["email"], {}).get("role") == "director"
-    )
+    """Toutes les directions actives, historiques ou créées par l'admin."""
+    profiles = []
+    for email, access in authorized_users.items():
+        if access.get("role") != "director":
+            continue
+        profiles.append(
+            {
+                "email": email,
+                "name": access.get("name", email),
+                "direction": access.get(
+                    "direction", f"Direction {access.get('name', email)}"
+                ),
+            }
+        )
+    return tuple(profiles)
 
 
 def update_authorization_scope(database_url, scope, updated_by, update_payload):
