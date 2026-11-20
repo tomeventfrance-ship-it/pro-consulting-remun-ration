@@ -766,7 +766,7 @@ DEFAULT_VALUES = {
     "creator_level": 9,
     "consultant_level": 9,
     "manager_level": 9,
-    "director_level": 8,
+    "director_level": 4,
     "revenue_usd": 0.0,
     "usd_to_eur": 0.92,
     "other_expenses": 0.0,
@@ -2799,15 +2799,28 @@ RESPONSABLE_RATES = {
     13: 0.025,
 }
 
+# Pourcentage du bénéfice global positif avant commission du directeur.
 DIRECTOR_RATES = {
-    4: 0.04,
-    5: 0.05,
-    7: 0.07,
-    8: 0.09,
-    10: 0.11,
-    11: 0.13,
-    13: 0.15,
+    4: 0.06,
+    5: 0.07,
+    7: 0.09,
+    9: 0.13,
+    10: 0.15,
+    13: 0.22,
 }
+
+
+def director_rate_for_performance(level):
+    """Prend le dernier palier atteint, sans commission sous 4 %."""
+    matched = [threshold for threshold in DIRECTOR_RATES if threshold <= int(level)]
+    return DIRECTOR_RATES[max(matched)] if matched else 0.0
+
+
+def director_level_for_selector(level):
+    """Compatibilité des anciens paramètres sauvegardés (8 %, 11 %)."""
+    matched = [threshold for threshold in DIRECTOR_RATES if threshold <= int(level)]
+    return max(matched) if matched else min(DIRECTOR_RATES)
+
 
 
 def calculate_agency_profit(
@@ -2986,10 +2999,7 @@ def calculate_director_branch_finances(
         - responsable_cost
         - float(other_expenses),
     )
-    director_rate = DIRECTOR_RATES.get(
-        int(st.session_state.director_level),
-        0.0,
-    )
+    director_rate = director_rate_for_performance(st.session_state.director_level)
     director_reward = net_profit_before_director * director_rate
 
     return {
@@ -3023,14 +3033,28 @@ def build_director_overview(
     for profile in director_profiles:
         email = profile["email"]
         direction_config = director_config[email]
-        selected_groups = direction_config["groups"]
+        unique_director = len(director_profiles) == 1
+        # Avec un directeur unique, l'affectation des groupes ne limite
+        # plus l'assiette de sa rémunération (sans changer les accès).
+        selected_groups = (
+            all_creator_results["Groupe"].fillna("").unique().tolist()
+            if unique_director else direction_config["groups"]
+        )
+        total_revenue_usd = (
+            float(st.session_state.revenue_usd)
+            if unique_director else direction_config["revenue_usd"]
+        )
+        total_other_expenses = (
+            float(st.session_state.other_expenses)
+            if unique_director else direction_config["other_expenses"]
+        )
 
-        if selected_groups:
+        if unique_director or selected_groups:
             branch_result = calculate_director_branch_finances(
                 all_creator_results=all_creator_results,
                 selected_groups=selected_groups,
-                revenue_usd=direction_config["revenue_usd"],
-                other_expenses=direction_config["other_expenses"],
+                revenue_usd=total_revenue_usd,
+                other_expenses=total_other_expenses,
                 usd_to_eur=usd_to_eur,
             )
         else:
@@ -3042,10 +3066,7 @@ def build_director_overview(
                 "consultant_cost": 0.0,
                 "responsable_cost": 0.0,
                 "net_profit_before_director": 0.0,
-                "director_rate": DIRECTOR_RATES.get(
-                    int(st.session_state.director_level),
-                    0.0,
-                ),
+                "director_rate": director_rate_for_performance(st.session_state.director_level),
                 "director_reward": 0.0,
                 "remaining_after_director": 0.0,
             }
@@ -3054,9 +3075,12 @@ def build_director_overview(
             {
                 "Directeur": profile["name"],
                 "Direction": profile["direction"],
-                "Groupes gérés": ", ".join(selected_groups) or "Aucun",
+                "Groupes gérés": (
+                    "Ensemble de la structure"
+                    if unique_director else ", ".join(selected_groups) or "Aucun"
+                ),
                 "Diamants générés": branch_result["diamonds_generated"],
-                "CA branche ($)": direction_config["revenue_usd"],
+                "CA branche ($)": total_revenue_usd,
                 "CA converti (€)": branch_result["revenue_eur"],
                 "Charges (€)": branch_result["charges_eur"],
                 "Coût créateurs (€)": branch_result["creator_cost"],
@@ -3064,9 +3088,7 @@ def build_director_overview(
                 "Coût responsables (€)": branch_result[
                     "responsable_cost"
                 ],
-                "Autres dépenses (€)": direction_config[
-                    "other_expenses"
-                ],
+                "Autres dépenses (€)": total_other_expenses,
                 "Bénéfice avant directeur (€)": branch_result[
                     "net_profit_before_director"
                 ],
@@ -3295,11 +3317,21 @@ DIRECTOR_MANAGEMENT_PROFILES = (
 
 
 def active_director_profiles(authorized_users):
-    """Les directions d’origine encore actives dans les vues de gestion."""
-    return tuple(
-        profile for profile in DIRECTOR_MANAGEMENT_PROFILES
-        if authorized_users.get(profile["email"], {}).get("role") == "director"
-    )
+    """Toutes les directions actives, historiques ou créées par l'admin."""
+    profiles = []
+    for email, access in authorized_users.items():
+        if access.get("role") != "director":
+            continue
+        profiles.append(
+            {
+                "email": email,
+                "name": access.get("name", email),
+                "direction": access.get(
+                    "direction", f"Direction {access.get('name', email)}"
+                ),
+            }
+        )
+    return tuple(profiles)
 
 
 def update_authorization_scope(database_url, scope, updated_by, update_payload):
@@ -3448,13 +3480,21 @@ def change_collaborator_status(payloads, email, active, groups_if_empty=None):
 
 
 def default_director_management_config():
+    """Inclut les directions historiques et les nouveaux accès actifs."""
+    emails = [profile["email"] for profile in DIRECTOR_MANAGEMENT_PROFILES]
+    emails.extend(
+        profile["email"]
+        for profile in active_director_profiles(
+            globals().get("AUTHORIZED_USERS", {})
+        )
+    )
     return {
-        profile["email"]: {
+        email: {
             "groups": [],
             "revenue_usd": 0.0,
             "other_expenses": 0.0,
         }
-        for profile in DIRECTOR_MANAGEMENT_PROFILES
+        for email in dict.fromkeys(emails)
     }
 
 
@@ -3474,8 +3514,7 @@ def clean_director_management_config(payload, available_groups):
     payload = payload if isinstance(payload, dict) else {}
     cleaned_config = default_director_management_config()
 
-    for profile in DIRECTOR_MANAGEMENT_PROFILES:
-        email = profile["email"]
+    for email in cleaned_config:
         saved_row = payload.get(email, {})
         saved_row = saved_row if isinstance(saved_row, dict) else {}
         saved_groups = saved_row.get("groups", [])
@@ -5729,13 +5768,18 @@ elif page == "⚙️ Paramètres":
                 ),
                 disabled=parameters_locked,
             )
+            director_levels = list(DIRECTOR_RATES)
             director_level = st.selectbox(
-                "Palier Directeur atteint",
-                [4, 5, 7, 8, 10, 11, 13],
-                index=[4, 5, 7, 8, 10, 11, 13].index(
-                    int(st.session_state.director_level)
+                "Performance collective TikTok (palier directeur)",
+                director_levels,
+                index=director_levels.index(
+                    director_level_for_selector(st.session_state.director_level)
                 ),
                 disabled=parameters_locked,
+                help=(
+                    "Taux du directeur appliqué au bénéfice global après "
+                    "les autres charges et avant sa propre commission."
+                ),
             )
 
         st.subheader("Paramètres financiers")
@@ -8145,6 +8189,14 @@ elif page == "🏢 Directeur de branche":
         ]
         st.divider()
         st.subheader("Vue d’ensemble des directions actives")
+        if len(director_profiles) == 1:
+            st.info(
+                "Directeur unique : le CA global, les charges et les "
+                "autres dépenses sont repris des paramètres de l'agence. "
+                "L'export Backstage doit contenir tous les groupes et "
+                "les dépenses des tournois et récompenses doivent être "
+                "incluses dans les autres dépenses."
+            )
         overview1, overview2, overview3, overview4 = st.columns(4)
         overview1.metric(
             "Groupes attribués",
@@ -8263,22 +8315,32 @@ elif page == "🏢 Directeur de branche":
             label="⬇️ Télécharger la vue des directions actives (Excel)",
         )
         st.caption(
-            "Les montants sont recalculés avec le taux BCE affiché et le "
-            "palier Directeur enregistré. Un directeur sans groupe attribué "
-            "reste à 0 € afin d’éviter une facture sans équipe rattachée."
+            "Les montants sont recalculés avec le taux BCE et le palier "
+            "Directeur enregistré. En direction unique, la commission porte "
+            "sur le bénéfice total avant directeur, même si aucun groupe "
+            "n'est attribué. Les affectations gèrent les accès aux imports."
         )
         st.stop()
 
-    st.subheader("Composition de la branche")
+    unique_director = len(active_director_profiles(AUTHORIZED_USERS)) == 1
+    if unique_director:
+        st.subheader("Toutes les équipes de Pro Consulting")
+        st.warning(
+            "Le calcul du directeur unique exige un export Backstage "
+            "complet de la structure. Un export limité à une branche "
+            "fausserait sa rémunération. Le chiffre d'affaires et les "
+            "dépenses communs sont définis par le fondateur."
+        )
+        st.session_state["director_selected_groups"] = available_groups
+    else:
+        st.subheader("Composition de la branche")
     selected_groups = st.multiselect(
-        "Cochez les responsables performance appartenant à cette branche",
+        "Équipes de la direction",
         options=available_groups,
         default=available_groups,
-        help=(
-            "Si l’export contient uniquement la branche du directeur, "
-            "laissez tous les responsables cochés."
-        ),
+        help="Toutes les équipes sont obligatoires pour le directeur unique.",
         key="director_selected_groups",
+        disabled=unique_director,
     )
 
     if not selected_groups:
@@ -8337,23 +8399,33 @@ elif page == "🏢 Directeur de branche":
         "par la banque."
     )
 
-    input1, input2 = st.columns(2)
-    revenue_usd = input1.number_input(
-        "Chiffre d’affaires Backstage de la branche ($)",
-        min_value=0.0,
-        value=float(st.session_state.director_branch_revenue_usd),
-        step=100.0,
-        key="director_revenue_input",
-    )
-    branch_other_expenses = input2.number_input(
-        "Autres dépenses propres à la branche (€)",
-        min_value=0.0,
-        value=float(st.session_state.director_branch_other_expenses),
-        step=10.0,
-        key="director_expenses_input",
-    )
-    st.session_state.director_branch_revenue_usd = revenue_usd
-    st.session_state.director_branch_other_expenses = branch_other_expenses
+    if unique_director:
+        revenue_usd = float(st.session_state.revenue_usd)
+        branch_other_expenses = float(st.session_state.other_expenses)
+        input1, input2 = st.columns(2)
+        input1.metric("Chiffre d'affaires global ($)", f"{revenue_usd:,.2f} $")
+        input2.metric(
+            "Autres dépenses globales (€)",
+            f"{branch_other_expenses:,.2f} €",
+        )
+    else:
+        input1, input2 = st.columns(2)
+        revenue_usd = input1.number_input(
+            "Chiffre d’affaires Backstage de la branche ($)",
+            min_value=0.0,
+            value=float(st.session_state.director_branch_revenue_usd),
+            step=100.0,
+            key="director_revenue_input",
+        )
+        branch_other_expenses = input2.number_input(
+            "Autres dépenses propres à la branche (€)",
+            min_value=0.0,
+            value=float(st.session_state.director_branch_other_expenses),
+            step=10.0,
+            key="director_expenses_input",
+        )
+        st.session_state.director_branch_revenue_usd = revenue_usd
+        st.session_state.director_branch_other_expenses = branch_other_expenses
 
     branch_creators = all_creator_results[
         all_creator_results["Groupe"].isin(selected_groups)
@@ -8426,10 +8498,7 @@ elif page == "🏢 Directeur de branche":
         - responsable_cost
         - branch_other_expenses,
     )
-    director_rate = DIRECTOR_RATES.get(
-        int(st.session_state.director_level),
-        0.0,
-    )
+    director_rate = director_rate_for_performance(st.session_state.director_level)
     director_reward = net_profit_before_director * director_rate
     remaining_after_director = (
         net_profit_before_director - director_reward
@@ -8476,7 +8545,10 @@ elif page == "🏢 Directeur de branche":
     )
 
     st.divider()
-    st.subheader("Résultat de la branche")
+    st.subheader(
+        "Résultat global Pro Consulting"
+        if unique_director else "Résultat de la branche"
+    )
     result1, result2, result3, result4 = st.columns(4)
     result1.metric("CA converti", f"{revenue_eur:,.2f} €")
     result2.metric(
@@ -8529,7 +8601,11 @@ elif page == "🏢 Directeur de branche":
             ("Rémunérations créateurs", -creator_cost),
             ("Rémunérations consultants", -consultant_cost),
             ("Rémunérations responsables performance", -responsable_cost),
-            ("Autres dépenses de la branche", -branch_other_expenses),
+            (
+                "Autres dépenses de la structure"
+                if unique_director else "Autres dépenses de la branche",
+                -branch_other_expenses,
+            ),
             ("Bénéfice avant directeur", net_profit_before_director),
             ("Rémunération du directeur", -director_reward),
             ("Bénéfice restant", remaining_after_director),
@@ -8735,10 +8811,7 @@ elif page == "💰 Bénéfice agence":
         else 0.0
     )
     agency_other_expenses = float(st.session_state.other_expenses)
-    director_rate = DIRECTOR_RATES.get(
-        int(st.session_state.director_level),
-        0.0,
-    )
+    director_rate = director_rate_for_performance(st.session_state.director_level)
 
     available_agency_groups = sorted(
         value
@@ -8774,6 +8847,12 @@ elif page == "💰 Bénéfice agence":
         available_agency_groups,
     )
     benefit_director_profiles = active_director_profiles(AUTHORIZED_USERS)
+    if len(benefit_director_profiles) > 1:
+        st.warning(
+            "Plusieurs accès directeur sont encore actifs. "
+            "Désactivez les anciens accès dans l'administration pour "
+            "appliquer le calcul du directeur unique sur le bénéfice global."
+        )
     benefit_group_owners = {}
     for profile in benefit_director_profiles:
         for group in benefit_director_config[profile["email"]]["groups"]:
@@ -8803,7 +8882,15 @@ elif page == "💰 Bénéfice agence":
         "result_before_directors"
     ]
     agency_director_overview = pd.DataFrame()
-    if benefit_has_director_assignments:
+    if len(benefit_director_profiles) == 1:
+        # Directeur unique : une seule commission calculée sur le bénéfice
+        # global, jamais la somme de simulations de branches.
+        directors_reward = agency_calculation["directors_reward"]
+        agency_profit = agency_calculation["agency_profit"]
+        director_invoice_source = (
+            "Directeur unique : bénéfice total de la structure"
+        )
+    elif benefit_has_director_assignments:
         agency_director_overview = build_director_overview(
             all_creator_results=agency_creators,
             director_config=benefit_director_config,
@@ -8891,9 +8978,11 @@ elif page == "💰 Bénéfice agence":
         )
 
     st.caption(
-        "Lorsque les groupes des quatre directeurs sont enregistrés, leurs "
-        "factures individuelles remplacent l’estimation globale dans ce "
-        "calcul. Le taux BCE ne modifie jamais la valeur facture par diamant."
+        "Avec un directeur unique, la commission est calculée une seule "
+        "fois sur le bénéfice global de Pro Consulting avant sa rémunération. "
+        "Les dépenses de tournois et récompenses doivent être renseignées "
+        "dans « Autres dépenses » si elles ne sont pas déjà déduites. "
+        "Le taux BCE ne modifie jamais la valeur facture par diamant."
     )
 
     agency_summary = pd.DataFrame(
